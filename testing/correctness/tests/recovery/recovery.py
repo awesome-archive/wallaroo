@@ -40,7 +40,7 @@ def test_recovery_pony():
 
 
 def test_recovery_machida():
-    command = 'machida_resilience --application-module sequence_window'
+    command = 'machida --application-module sequence_window'
     _test_recovery(command)
 
 

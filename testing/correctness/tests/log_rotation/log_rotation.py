@@ -53,7 +53,7 @@ def test_log_rotation_external_trigger_no_recovery_pony():
 
 
 def test_log_rotation_external_trigger_no_recovery_machida():
-    command = 'machida_resilience --application-module sequence_window'
+    command = 'machida --application-module sequence_window'
     _test_log_rotation_external_trigger_no_recovery(command)
 
 
@@ -204,7 +204,7 @@ def test_log_rotation_external_trigger_recovery_pony():
 
 
 def test_log_rotation_external_trigger_recovery_machida():
-    command = 'machida_resilience --application-module sequence_window'
+    command = 'machida --application-module sequence_window'
     _test_log_rotation_external_trigger_recovery(command)
 
 
@@ -383,7 +383,7 @@ def test_log_rotation_file_size_trigger_no_recovery_pony():
 
 
 def test_log_rotation_file_size_trigger_no_recovery_machida():
-    command = 'machida_resilience --application-module sequence_window'
+    command = 'machida --application-module sequence_window'
     _test_log_rotation_file_size_trigger_no_recovery(command)
 
 
@@ -522,7 +522,7 @@ def test_log_rotation_file_size_trigger_recovery_pony():
 
 
 def test_log_rotation_file_size_trigger_recovery_machida():
-    command = 'machida_resilience --application-module sequence_window'
+    command = 'machida --application-module sequence_window'
     _test_log_rotation_file_size_trigger_recovery(command)
 
 

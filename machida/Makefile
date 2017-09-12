@@ -40,6 +40,7 @@ WALLAROO_LIB =  $(buffy_path)/lib
 # with our own custom rules. This allows the top level commands like
 # "make test" to work.
 build-machida: machida_build
+build-machida_resilience: machida_build_resilience
 test-machida: build-machida
 clean-machida: machida_clean
 
