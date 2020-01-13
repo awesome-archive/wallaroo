@@ -23,243 +23,280 @@ use "net"
 use "promises"
 use "serialise"
 use "wallaroo"
+use "wallaroo/core/autoscale"
+use "wallaroo/core/barrier"
 use "wallaroo/core/boundary"
+use "wallaroo/core/checkpoint"
+use "wallaroo/core/cluster_manager"
 use "wallaroo/core/common"
-use "wallaroo/ent/data_receiver"
-use "wallaroo/ent/cluster_manager"
-use "wallaroo/ent/network"
-use "wallaroo/ent/recovery"
-use "wallaroo/ent/router_registry"
 use "wallaroo/core/data_channel"
+use "wallaroo/core/data_receiver"
+use "wallaroo/core/invariant"
+use "wallaroo/core/keys"
 use "wallaroo/core/messages"
 use "wallaroo/core/metrics"
+use "wallaroo/core/network"
+use "wallaroo/core/partitioning"
+use "wallaroo/core/recovery"
+use "wallaroo/core/registries"
 use "wallaroo/core/routing"
 use "wallaroo/core/sink/tcp_sink"
 use "wallaroo/core/source"
+use "wallaroo/core/source/barrier_source"
+use "wallaroo/core/source/connector_source"
+use "wallaroo/core/step"
 use "wallaroo/core/topology"
+use "wallaroo_labs/collection_helpers"
 use "wallaroo_labs/dag"
 use "wallaroo_labs/equality"
 use "wallaroo_labs/messages"
 use "wallaroo_labs/mort"
 use "wallaroo_labs/queue"
+use "wallaroo_labs/string_set"
+
 
 class val LocalTopology
   let _app_name: String
-  let _worker_name: String
-  let _graph: Dag[StepInitializer] val
-  let _step_map: Map[U128, (ProxyAddress | U128)] val
-  // _state_builders maps from state_name to StateSubpartition
-  let _state_builders: Map[String, StateSubpartition] val
-  let _pre_state_data: Array[PreStateData] val
-  let _proxy_ids: Map[String, U128] val
-  // TODO: Replace this default strategy with a better one after POC
-  let default_target: (Array[StepBuilder] val | ProxyAddress | None)
-  let default_state_name: String
-  let default_target_id: U128
-  // resilience
-  let worker_names: Array[String] val
+  let _worker_name: WorkerName
+  let _graph: Dag[ExecutionStageBuilder] val
+  // A map from node ids in the graph to one or more routing ids per node,
+  // depending on the parallelism.
+  let _routing_ids: Map[U128, SetIs[RoutingId] val] val
+  let step_group_routing_ids:
+    Map[RoutingId, Map[WorkerName, RoutingId] val] val
+  let worker_names: Array[WorkerName] val
+  // Workers that cannot be removed during shrink to fit
+  let non_shrinkable: SetIs[WorkerName] val
+  // Each worker has one BarrierSource with a unique id
+  let barrier_source_id: RoutingId
 
-  new val create(name': String, worker_name': String,
-    graph': Dag[StepInitializer] val,
-    step_map': Map[U128, (ProxyAddress | U128)] val,
-    state_builders': Map[String, StateSubpartition] val,
-    pre_state_data': Array[PreStateData] val,
-    proxy_ids': Map[String, U128] val,
-    default_target': (Array[StepBuilder] val | ProxyAddress | None) =
-      None,
-    default_state_name': String = "", default_target_id': U128 = 0,
-    worker_names': Array[String] val)
+  new val create(name': String, worker_name': WorkerName,
+    graph': Dag[ExecutionStageBuilder] val,
+    routing_ids': Map[U128, SetIs[RoutingId] val] val,
+    worker_names': Array[WorkerName] val,
+    non_shrinkable': SetIs[WorkerName] val,
+    step_group_routing_ids':
+      Map[RoutingId, Map[WorkerName, RoutingId] val] val,
+    barrier_source_id': RoutingId)
   =>
     _app_name = name'
     _worker_name = worker_name'
     _graph = graph'
-    _step_map = step_map'
-    _state_builders = state_builders'
-    _pre_state_data = pre_state_data'
-    _proxy_ids = proxy_ids'
-    // TODO: Replace this default strategy with a better one after POC
-    default_target = default_target'
-    default_state_name = default_state_name'
-    default_target_id = default_target_id'
-    //resilience
+    _routing_ids = routing_ids'
     worker_names = worker_names'
+    non_shrinkable = non_shrinkable'
+    step_group_routing_ids = step_group_routing_ids'
+    barrier_source_id = barrier_source_id'
 
-  fun state_builders(): Map[String, StateSubpartition] val =>
-    _state_builders
+  fun new_barrier_source_id(barrier_source_id': RoutingId): LocalTopology =>
+    LocalTopology(_app_name, _worker_name, _graph, _routing_ids,
+      worker_names, non_shrinkable, step_group_routing_ids, barrier_source_id')
 
-  fun update_state_map(state_name: String,
-    state_map: Map[String, Router],
-    metrics_conn: MetricsSink, event_log: EventLog,
-    recovery_replayer: RecoveryReplayer,
-    auth: AmbientAuth, outgoing_boundaries: Map[String, OutgoingBoundary] val,
-    initializables: SetIs[Initializable],
-    data_routes: Map[U128, Consumer tag],
-    default_router: (Router | None)) ?
-  =>
-    let subpartition =
-      try
-        _state_builders(state_name)
-      else
-        @printf[I32](("Tried to update state map with nonexistent state " +
-          "name " + state_name + "\n").cstring())
-        error
-      end
+  fun routing_ids(): Map[U128, SetIs[RoutingId] val] val =>
+    _routing_ids
 
-    if not state_map.contains(state_name) then
-      @printf[I32](("----Creating state steps for " + state_name + "----\n")
-        .cstring())
-      state_map(state_name) = subpartition.build(_app_name, _worker_name,
-         metrics_conn, auth, event_log, recovery_replayer, outgoing_boundaries,
-         initializables, data_routes, default_router)
-    end
+  fun graph(): Dag[ExecutionStageBuilder] val =>
+    _graph
 
-  fun graph(): Dag[StepInitializer] val => _graph
+  fun name(): String =>
+    _app_name
 
-  fun pre_state_data(): Array[PreStateData] val => _pre_state_data
-
-  fun step_map(): Map[U128, (ProxyAddress | U128)] val => _step_map
-
-  fun name(): String => _app_name
-
-  fun worker_name(): String => _worker_name
+  fun worker_name(): WorkerName =>
+    _worker_name
 
   fun is_empty(): Bool =>
     _graph.is_empty()
 
-  fun proxy_ids(): Map[String, U128] val => _proxy_ids
-
-  fun update_proxy_address_for_state_key[Key: (Hashable val &
-    Equatable[Key] val)](
-    state_name: String, key: Key, pa: ProxyAddress): LocalTopology ?
-  =>
-    let new_subpartition = _state_builders(state_name).update_key[Key](key, pa)
-    let new_state_builders = recover trn Map[String, StateSubpartition] end
-    for (k, v) in _state_builders.pairs() do
-      new_state_builders(k) = v
-    end
-    new_state_builders(state_name) = new_subpartition
-    LocalTopology(_app_name, _worker_name, _graph, _step_map,
-      consume new_state_builders, _pre_state_data, _proxy_ids, default_target,
-      default_state_name, default_target_id, worker_names)
-
-  fun val add_worker_name(w: String): LocalTopology =>
-    if not worker_names.contains(w) then
-      let new_worker_names = recover trn Array[String] end
-      for n in worker_names.values() do
-        new_worker_names.push(n)
+  fun val assign_routing_ids(gen: RoutingIdGenerator): LocalTopology =>
+    let r_ids = recover iso Map[U128, SetIs[RoutingId] val] end
+    for n in _graph.nodes() do
+      let next = recover iso SetIs[RoutingId] end
+      for _ in Range(0, n.value.parallelism()) do
+        next.set(gen())
       end
-      new_worker_names.push(w)
-      LocalTopology(_app_name, _worker_name, _graph, _step_map,
-        _state_builders, _pre_state_data, _proxy_ids, default_target,
-        default_state_name, default_target_id, consume new_worker_names)
+      r_ids(n.id) = consume next
+    end
+    LocalTopology(_app_name, _worker_name, _graph, consume r_ids,
+      worker_names, non_shrinkable, step_group_routing_ids, barrier_source_id)
+
+  fun val step_group_routing_ids_for(w: WorkerName):
+    Map[RoutingId, RoutingId] val
+  =>
+    let sgri = recover iso Map[RoutingId, RoutingId] end
+    for (group_id, ws) in step_group_routing_ids.pairs() do
+      try
+        sgri(group_id) = ws(w)?
+      else
+        Fail()
+      end
+    end
+    consume sgri
+
+  fun val add_new_worker(new_worker: WorkerName,
+    joining_step_group_routing_ids:
+      (Map[RoutingId, RoutingId] val | None) = None): LocalTopology
+  =>
+    try
+      let routing_id_gen = RoutingIdGenerator
+      // Get or generate step group routing ids for new worker
+      let new_step_group_routing_ids_iso =
+        recover iso Map[RoutingId, Map[WorkerName, RoutingId] val] end
+      for (group_id, ws_map) in step_group_routing_ids.pairs() do
+        let new_ws_map = recover iso Map[WorkerName, RoutingId] end
+        for (w, r_id) in ws_map.pairs() do
+          new_ws_map(w) = r_id
+        end
+        match joining_step_group_routing_ids
+        | let jsri: Map[RoutingId, RoutingId] val =>
+          new_ws_map(new_worker) = jsri(group_id)?
+        else
+          new_ws_map(new_worker) = routing_id_gen()
+        end
+        new_step_group_routing_ids_iso(group_id) = consume new_ws_map
+      end
+      let new_step_group_routing_ids =
+        consume val new_step_group_routing_ids_iso
+
+      let new_worker_names = recover iso Array[WorkerName] end
+      for w in worker_names.values() do
+        new_worker_names.push(w)
+      end
+      new_worker_names.push(new_worker)
+
+      LocalTopology(_app_name, new_worker, _graph, _routing_ids,
+        consume new_worker_names, non_shrinkable, new_step_group_routing_ids,
+        barrier_source_id)
     else
+      Fail()
       this
     end
 
-  fun val for_new_worker(new_worker: String): LocalTopology ? =>
-    let w_names =
-      if not worker_names.contains(new_worker) then
-        add_worker_name(new_worker).worker_names
-      else
-        worker_names
-      end
-
-    let g = Dag[StepInitializer]
-    // Pick up sinks, which are shared across workers
-    for node in _graph.nodes() do
-      match node.value
-      | let egress: EgressBuilder =>
-        g.add_node(egress, node.id)
+  fun val remove_worker(ws: Array[WorkerName] val): LocalTopology
+  =>
+    let new_worker_names = recover iso Array[WorkerName] end
+    for w in worker_names.values() do
+      if not ArrayHelpers[WorkerName].contains[WorkerName](ws, w) then
+        new_worker_names.push(w)
       end
     end
 
-    LocalTopology(_app_name, new_worker, g.clone(),
-      _step_map, _state_builders, _pre_state_data, _proxy_ids,
-      default_target, default_state_name, default_target_id,
-      w_names)
+    // Remove step group routing ids
+    let new_step_group_routing_ids =
+      recover iso Map[RoutingId, Map[WorkerName, RoutingId] val] end
+    for (group_id, ws_map) in step_group_routing_ids.pairs() do
+      let new_ws_map = recover iso Map[WorkerName, RoutingId] end
+      for (w, r_id) in ws_map.pairs() do
+        if not ArrayHelpers[WorkerName].contains[WorkerName](ws, w) then
+          new_ws_map(w) = r_id
+        end
+      end
+      new_step_group_routing_ids(group_id) = consume new_ws_map
+    end
+
+    LocalTopology(_app_name, _worker_name, _graph, _routing_ids,
+      consume new_worker_names, non_shrinkable,
+      consume new_step_group_routing_ids, barrier_source_id)
 
   fun eq(that: box->LocalTopology): Bool =>
-    // This assumes that _graph, _pre_state_data, default_target,
-    // default_state_name, and default_target_id never change over time
+    // This assumes that _graph and _pre_state_data never change over time
     (_app_name == that._app_name) and
       (_worker_name == that._worker_name) and
       (_graph is that._graph) and
-      MapEquality2[U128, ProxyAddress, U128](_step_map, that._step_map)
-        and
-      MapEquality[String, StateSubpartition](_state_builders,
-        that._state_builders) and
-      (_pre_state_data is that._pre_state_data) and
-      MapEquality[String, U128](_proxy_ids, that._proxy_ids) and
-      (default_target is that.default_target) and
-      (default_state_name == that.default_state_name) and
-      (default_target_id == that.default_target_id) and
+      // TODO: Add further conditions to this eq test
+      // MapEquality2[U128, ProxyAddress, U128](_step_map, that._step_map)
+      //   and
+      // MapEquality[String, StateSubpartitions](_state_builders,
+      //   that._state_builders) and
+      // (_pre_state_data is that._pre_state_data) and
+      // MapEquality[String, U128](_boundary_ids, that._boundary_ids) and
       ArrayEquality[String](worker_names, that.worker_names)
 
   fun ne(that: box->LocalTopology): Bool => not eq(that)
 
 actor LocalTopologyInitializer is LayoutInitializer
-  let _application: Application val
-  let _worker_name: String
+  var _phase: LocalTopologyInitializerPhase =
+    _ApplicationAwaitingInitializationPhase
+  let _app_name: String
+  let _worker_name: WorkerName
   let _env: Env
   let _auth: AmbientAuth
   let _connections: Connections
+  let _autoscale: Autoscale
   let _router_registry: RouterRegistry
   let _metrics_conn: MetricsSink
   let _data_receivers: DataReceivers
   let _event_log: EventLog
   let _recovery: Recovery
-  let _recovery_replayer: RecoveryReplayer
+  let _recovery_replayer: RecoveryReconnecter
+  let _checkpoint_initiator: CheckpointInitiator
+  let _barrier_coordinator: BarrierCoordinator
   var _is_initializer: Bool
   var _outgoing_boundary_builders:
-    Map[String, OutgoingBoundaryBuilder] val =
-      recover Map[String, OutgoingBoundaryBuilder] end
-  var _outgoing_boundaries: Map[String, OutgoingBoundary] val =
-    recover Map[String, OutgoingBoundary] end
+    Map[WorkerName, OutgoingBoundaryBuilder] val =
+      recover Map[WorkerName, OutgoingBoundaryBuilder] end
+  var _outgoing_boundaries: Map[WorkerName, OutgoingBoundary] val =
+    recover Map[WorkerName, OutgoingBoundary] end
   var _topology: (LocalTopology | None) = None
   let _local_topology_file: String
   var _cluster_initializer: (ClusterInitializer | None) = None
   let _data_channel_file: String
   let _worker_names_file: String
-  var _topology_initialized: Bool = false
-  var _recovered_worker_names: Array[String] val =
-    recover val Array[String] end
-  var _recovering: Bool = false
+  let _local_keys_file: LocalKeysFile
+  let _the_journal: SimpleJournal
+  let _do_local_file_io: Bool
+  var _recovered_worker_names: Array[WorkerName] val =
+    recover val Array[WorkerName] end
+  var _is_recovering: Bool = false
+  var _recovery_overridden: Bool = false
   let _is_joining: Bool
 
-  let _step_id_gen: StepIdGenerator = StepIdGenerator
+  let _routing_id_gen: RoutingIdGenerator = RoutingIdGenerator
+  let _string_id_gen: RoutingIdFromStringGenerator =
+    RoutingIdFromStringGenerator
+  // Map from the source name to the WorkerSourceConfig
+  let _worker_source_configs: Map[SourceName, WorkerSourceConfig] val
 
-  // Lifecycle
-  var _omni_router: (OmniRouter | None) = None
-  var _created: SetIs[Initializable] = _created.create()
-  var _initialized: SetIs[Initializable] = _initialized.create()
-  var _ready_to_work: SetIs[Initializable] = _ready_to_work.create()
-  let _initializables: SetIs[Initializable] = _initializables.create()
-
-  // Accumulate all TCPSourceListenerBuilders so we can build them
+  // Accumulate all SourceCoordinatorBuilders so we can build them
   // once EventLog signals we're ready
-  let sl_builders: Array[SourceListenerBuilder] =
-    recover iso Array[SourceListenerBuilder] end
+  let _sc_builders: Array[SourceCoordinatorBuilder] =
+    recover iso Array[SourceCoordinatorBuilder] end
+  let _sc_actors: Array[SourceCoordinator] =
+    recover iso Array[SourceCoordinator] end
 
   // Cluster Management
   var _cluster_manager: (ClusterManager | None) = None
 
+  // LIFECYCLE
+  // !TODO!: These are being treated as special cases right now outside of
+  // the phases. This is because a recovering worker can have its recovery
+  // process overridden at any time by another recovering worker. We need a
+  // way to keep track of this fact no matter what phase we are in.
+  var _recovery_ready_to_work: Bool = false
+  var _event_log_ready_to_work: Bool = false
+
   var _t: USize = 0
 
-  new create(app: Application val, worker_name: String, env: Env,
-    auth: AmbientAuth, connections: Connections,
+  new create(app_name: String, worker_name: WorkerName, env: Env,
+    auth: AmbientAuth, connections: Connections, autoscale: Autoscale,
     router_registry: RouterRegistry, metrics_conn: MetricsSink,
     is_initializer: Bool, data_receivers: DataReceivers,
     event_log: EventLog, recovery: Recovery,
-    recovery_replayer: RecoveryReplayer,
+    recovery_replayer: RecoveryReconnecter,
+    checkpoint_initiator: CheckpointInitiator,
+    barrier_coordinator: BarrierCoordinator,
     local_topology_file: String, data_channel_file: String,
-    worker_names_file: String, cluster_manager: (ClusterManager | None) = None,
+    worker_names_file: String, local_keys_filepath: FilePath,
+    the_journal: SimpleJournal, do_local_file_io: Bool,
+    worker_source_configs: Map[SourceName, WorkerSourceConfig] val,
+    cluster_manager: (ClusterManager | None) = None,
     is_joining: Bool = false)
   =>
-    _application = app
+    _app_name = app_name
     _worker_name = worker_name
     _env = env
     _auth = auth
     _connections = connections
+    _autoscale = autoscale
     _router_registry = router_registry
     _metrics_conn = metrics_conn
     _is_initializer = is_initializer
@@ -267,71 +304,28 @@ actor LocalTopologyInitializer is LayoutInitializer
     _event_log = event_log
     _recovery = recovery
     _recovery_replayer = recovery_replayer
+    _checkpoint_initiator = checkpoint_initiator
+    _barrier_coordinator = barrier_coordinator
     _local_topology_file = local_topology_file
     _data_channel_file = data_channel_file
     _worker_names_file = worker_names_file
+    _local_keys_file = LocalKeysFile(local_keys_filepath, the_journal, auth,
+      do_local_file_io)
+    _the_journal = the_journal
+    _do_local_file_io = do_local_file_io
     _cluster_manager = cluster_manager
     _is_joining = is_joining
+    _worker_source_configs = worker_source_configs
+    _router_registry.register_local_topology_initializer(this)
+    _phase.set_initializable(_checkpoint_initiator)
+    _phase.set_initializable(_barrier_coordinator)
+    _recovery.update_initializer(this)
 
   be update_topology(t: LocalTopology) =>
     _topology = t
 
-  be add_new_worker(w: String, joining_host: String,
-    control_addr: (String, String), data_addr: (String, String))
-  =>
-    _add_worker_name(w)
-    _connections.create_control_connection(w, joining_host, control_addr._2)
-    _connections.create_data_connection_to_joining_worker(w, joining_host,
-      data_addr._2, this)
-    let new_boundary_id = _step_id_gen()
-    _connections.create_boundary_to_new_worker(w, new_boundary_id, this)
-    @printf[I32]("***New worker %s added to cluster!***\n".cstring(),
-      w.cstring())
-
-  be add_boundary_to_new_worker(w: String, boundary: OutgoingBoundary,
-    builder: OutgoingBoundaryBuilder)
-  =>
-    _add_boundary(w, boundary, builder)
-    _router_registry.register_boundaries(_outgoing_boundaries,
-      _outgoing_boundary_builders)
-    // TODO: This is currently the hook to say "new worker has joined, let's
-    // start migrating state steps to it." This seems like a surprising place
-    // for this to happen though.
-    _router_registry.migrate_onto_new_worker(w)
-
-  fun ref _add_worker_name(w: String) =>
-    match _topology
-    | let t: LocalTopology =>
-      _topology = t.add_worker_name(w)
-      _save_local_topology()
-      _save_worker_names()
-    else
-      Fail()
-    end
-
-  fun ref _add_boundary(target_worker: String, boundary: OutgoingBoundary,
-    builder: OutgoingBoundaryBuilder)
-  =>
-    // Boundaries
-    let bs = recover trn Map[String, OutgoingBoundary] end
-    for (w, b) in _outgoing_boundaries.pairs() do
-      bs(w) = b
-    end
-    bs(target_worker) = boundary
-
-    // Boundary builders
-    let bbs = recover trn Map[String, OutgoingBoundaryBuilder] end
-    for (w, b) in _outgoing_boundary_builders.pairs() do
-      bbs(w) = b
-    end
-    bbs(target_worker) = builder
-
-    _outgoing_boundaries = consume bs
-    _outgoing_boundary_builders = consume bbs
-    _initializables.set(boundary)
-
-  be update_boundaries(bs: Map[String, OutgoingBoundary] val,
-    bbs: Map[String, OutgoingBoundaryBuilder] val)
+  be update_boundaries(bs: Map[WorkerName, OutgoingBoundary] val,
+    bbs: Map[WorkerName, OutgoingBoundaryBuilder] val)
   =>
     // This should only be called during initialization
     if (_outgoing_boundaries.size() > 0) or
@@ -345,23 +339,23 @@ actor LocalTopologyInitializer is LayoutInitializer
     // TODO: This no longer captures all boundaries because of boundary per
     // source. Does this matter without backpressure?
     for boundary in bs.values() do
-      _initializables.set(boundary)
+      _phase.set_initializable(boundary)
     end
 
-  be create_data_channel_listener(ws: Array[String] val,
+  be create_data_channel_listener(ws: Array[WorkerName] val,
     host: String, service: String,
     cluster_initializer: (ClusterInitializer | None) = None)
   =>
     try
-      let data_channel_filepath = FilePath(_auth, _data_channel_file)
+      let data_channel_filepath = FilePath(_auth, _data_channel_file)?
       if not _is_initializer then
         let data_notifier: DataChannelListenNotify iso =
           DataChannelListenNotifier(_worker_name, _auth, _connections,
             _is_initializer,
-            MetricsReporter(_application.name(), _worker_name,
+            MetricsReporter(_app_name, _worker_name,
               _metrics_conn),
             data_channel_filepath, this, _data_receivers, _recovery_replayer,
-            _router_registry)
+            _autoscale, _router_registry, _the_journal, _do_local_file_io)
 
         _connections.make_and_register_recoverable_data_channel_listener(
           _auth, consume data_notifier, _router_registry,
@@ -370,41 +364,903 @@ actor LocalTopologyInitializer is LayoutInitializer
         match cluster_initializer
           | let ci: ClusterInitializer =>
             _connections.create_initializer_data_channel_listener(
-              _data_receivers, _recovery_replayer, _router_registry, ci,
-              data_channel_filepath, this)
+              _data_receivers, _recovery_replayer, _autoscale,
+              _router_registry, ci, data_channel_filepath, this)
         end
       end
     else
       @printf[I32]("FAIL: cannot create data channel\n".cstring())
     end
 
-  be create_connections(control_addrs: Map[String, (String, String)] val,
-    data_addrs: Map[String, (String, String)] val)
+  be create_connections(control_addrs: Map[WorkerName, (String, String)] val,
+    data_addrs: Map[WorkerName, (String, String)] val)
   =>
-    _connections.create_connections(control_addrs, data_addrs, this)
+    _connections.create_connections(control_addrs, data_addrs, this,
+      _router_registry)
 
-  be quick_initialize_data_connections() =>
-    """
-    Called as part of joining worker's initialization
-    """
-    _connections.quick_initialize_data_connections(this)
+  be abort_recovery_early() =>
+    _recovery_overridden = true
 
-  be recover_and_initialize(ws: Array[String] val,
+  be initialize(cluster_initializer: (ClusterInitializer | None) = None,
+    checkpoint_target: (CheckpointId | None) = None,
+    recovering_without_resilience: Bool = false)
+  =>
+    let worker_count: (USize | None) =
+      match _topology
+      | let t: LocalTopology => t.worker_names.size()
+      else
+        None
+      end
+    _phase.initialize(this, cluster_initializer, checkpoint_target,
+      recovering_without_resilience, worker_count)
+
+  fun ref _initialize(initializables: Initializables,
+    cluster_initializer: (ClusterInitializer | None) = None,
+    checkpoint_target: (CheckpointId | None) = None,
+    recovering_without_resilience: Bool = false,
+    workers_ready_to_work: SetIs[WorkerName] = SetIs[WorkerName])
+  =>
+    _is_recovering =
+      match checkpoint_target
+      | let id: CheckpointId =>
+        _recovery.update_checkpoint_id(id)
+        true
+      else
+        false
+      end
+
+    @printf[I32](("------------------------------------------------------" +
+      "---\n").cstring())
+    @printf[I32]("|v|v|v|Initializing Local Topology|v|v|v|\n\n".cstring())
+    _cluster_initializer = cluster_initializer
+
+    try
+      // Check if we are recovering and need to read our local topology in
+      // from disk.
+      try
+        let local_topology_file = FilePath(_auth, _local_topology_file)?
+        if local_topology_file.exists() then
+          //we are recovering an existing worker topology
+          let data = recover val
+            // TODO: We assume that all journal data is copied to local file
+            // system first
+            let file = File(local_topology_file)
+            file.read(file.size())
+          end
+          match Serialised.input(InputSerialisedAuth(_auth), data)(
+            DeserialiseAuth(_auth))?
+          | let t: LocalTopology val =>
+            _topology = t
+          else
+            @printf[I32]("Error restoring previous topology!".cstring())
+            Fail()
+          end
+        end
+      else
+        @printf[I32]("Error restoring previous topology!".cstring())
+        Fail()
+      end
+
+      match _topology
+      | let t: LocalTopology =>
+        let worker_count = t.worker_names.size()
+
+        if (worker_count > 1) and (_outgoing_boundaries.size() == 0) then
+          @printf[I32]("Outgoing boundaries not set up!\n".cstring())
+          error
+        end
+
+        for w in t.worker_names.values() do
+          _barrier_coordinator.add_worker(w)
+          _checkpoint_initiator.add_worker(w)
+        end
+
+        _save_local_topology()
+        _save_worker_names()
+
+        // Determine if we need to read in local keys for our state collections
+        let local_keys: Map[RoutingId, KeySet val] val =
+          if _is_recovering then
+            @printf[I32]("Reading local keys from file.\n".cstring())
+            try
+              _local_keys_file.read_local_keys(
+                checkpoint_target as CheckpointId)
+            else
+              Fail()
+              recover val Map[RoutingId, KeySet val] end
+            end
+          else
+            // We don't have any local keys yet since this is our initial
+            // startup.
+            recover iso Map[RoutingId, KeySet val] end
+          end
+
+        if t.is_empty() then
+          @printf[I32]("----This worker has no steps----\n".cstring())
+        end
+
+        let graph = t.graph()
+
+        @printf[I32]("Creating graph:\n".cstring())
+        @printf[I32]((graph.string() + "\n").cstring())
+
+        @printf[I32]("\nInitializing %s application locally:\n\n".cstring(),
+          t.name().cstring())
+
+        // Keep track of all Consumers by id so we can create a
+        // DataRouter for the data channel boundary
+        var data_routes = recover trn Map[U128, Consumer] end
+
+        // Keep track of routers to the steps we've built
+        let built_routers = Map[U128, Router]
+
+        // Keep track of state and stateless steps for registration with
+        // DataRouters.
+        let built_state_steps = Map[RoutingId, Array[Step] val]
+        let built_stateless_steps = Map[RoutingId, Array[Step] val]
+
+        // Keep track of partition routers
+        let state_partition_routers = Map[RoutingId, StatePartitionRouter]
+        let stateless_partition_routers =
+          Map[RoutingId, StatelessPartitionRouter]
+
+        // If this worker has at least one Source, then we'll also need a
+        // a BarrierSource to ensure that checkpoint barriers always get to
+        // source targets (even if our local Sources pop out of existence
+        // for some reason, as when TCPSources disconnect).
+        var barrier_source: (BarrierSource | None) = None
+
+        /////////
+        // Initialize based on DAG
+        //
+        // ASSUMPTION: Acyclic graph
+        /////////
+        let nodes_to_initialize = Array[DagNode[ExecutionStageBuilder] val]
+
+        //////////////////////////////////////////////////////////////////////
+        // 1. Find graph sinks and add to nodes to initialize queue.
+        //    We'll work our way backwards.
+        //    We use a frontier queue to ensure that we add to the
+        //    initialization queue in waves, starting with all sinks, followed
+        //    by all inputs to those sinks, followed by all inputs to those
+        //    inputs, etc. until we get to the sources.
+        let frontier = Array[DagNode[ExecutionStageBuilder] val]
+
+        @printf[I32]("Adding sink nodes to nodes to initialize\n".cstring())
+        for sink_node in graph.sinks() do
+          @printf[I32](("Adding %s node to nodes to initialize\n").cstring(),
+            sink_node.value.name().cstring())
+          nodes_to_initialize.push(sink_node)
+          frontier.push(sink_node)
+        end
+
+        while frontier.size() > 0 do
+          let next_node = frontier.shift()?
+          for i_node in next_node.ins() do
+            if not nodes_to_initialize.contains(i_node) then
+              @printf[I32](("Adding %s node to nodes to initialize\n")
+                .cstring(), i_node.value.name().cstring())
+              nodes_to_initialize.push(i_node)
+              frontier.push(i_node)
+            end
+          end
+        end
+
+        //////////////////////////////////////////////////////////////////////
+        // 2. Loop: Get next node from nodes to initialize queue, and check if
+        //          all its outputs have been created yet.
+        //       if no, send to that node to end of nodes to initialize queue.
+        //       if yes, build the actor (connecting it to its output actors,
+        //         which have already been built)
+        // If there are no cycles (as per our assumption), this will terminate
+        while nodes_to_initialize.size() > 0 do
+          let next_node =
+            try
+              nodes_to_initialize.shift()?
+            else
+              @printf[I32](("Graph nodes to initialize queue was empty when " +
+                "node was still expected\n").cstring())
+              error
+            end
+
+          if built_routers.contains(next_node.id) then
+            @printf[I32](("We've already handled %s with id %s\n").cstring(),
+              next_node.value.name().cstring(),
+              next_node.id.string().cstring())
+            Fail()
+          end
+
+          // We are only ready to build a node if all of its outputs
+          // have been built
+          if _is_ready_for_building(next_node, built_routers) then
+            @printf[I32](("Initializing " + next_node.value.name() + " node\n")
+              .cstring())
+
+            let next_initializer: ExecutionStageBuilder = next_node.value
+
+            ///////////////////////////////////////////////////////////////////
+            // Determine if the next initializer is for a step, sink, or source
+            match next_initializer
+            | let builder: StepBuilder =>
+            ///////////////
+            // STEP BUILDER
+            ///////////////
+              @printf[I32](("----Spinning up " + builder.name() + "----\n")
+                .cstring())
+              // Each worker has its own execution ids assigned for a given
+              // node id. For example, if this is a parallel stateless
+              // computation, then there will be an execution id for each
+              // of the n steps that must be created given a parallelism of n.
+              let node_id = next_node.id
+              let execution_ids = t.routing_ids()(node_id)?
+
+              let out_ids: Array[RoutingId] val =
+                try
+                  _get_output_node_ids(next_node)?
+                else
+                  @printf[I32]("Failed to get output node ids\n".cstring())
+                  error
+                end
+
+              // Determine router for outputs from this computation.
+              let out_router =
+                if out_ids.size() > 0 then
+                  let routers = recover iso Array[Router] end
+                  for id in out_ids.values() do
+                    try
+                      routers.push(built_routers(id)?)
+                    else
+                      @printf[I32]("No router found to target\n".cstring())
+                      error
+                    end
+                  end
+                  ifdef debug then
+                    Invariant(routers.size() > 0)
+                  end
+                  if routers.size() == 1 then
+                    routers(0)?
+                  else
+                    MultiRouter(consume routers)
+                  end
+                else
+                  // There should be at least one output for a stateless
+                  // computation.
+                  Fail()
+                  EmptyRouter
+                end
+
+              if builder.is_stateful() then
+                //////////////////////////////////
+                // STATE COMPUTATION
+                let step_group = builder.routing_group()
+
+                /////////
+                // Create n steps given a parallelism of n. Then use these
+                // to create a StatePartitionRouter.
+                let step_group_steps = create_step_group(execution_ids,
+                  builder, out_router, _is_recovering)
+
+                // Now that we've built all the individual local steps in this
+                // group, we need to record that we built this group and
+                // then create the StatelessPartitionRouter that routes
+                // messages to it.
+                let router_state_steps_iso = recover iso Array[Step] end
+                let router_state_step_ids_iso =
+                  recover iso Map[RoutingId, Step] end
+                for (r_id, next_step) in step_group_steps.pairs() do
+                  router_state_steps_iso.push(next_step)
+                  router_state_step_ids_iso(r_id) = next_step
+                  data_routes(r_id) = next_step
+                  initializables.set(next_step)
+                end
+                let router_state_steps = consume val router_state_steps_iso
+                let router_state_step_ids =
+                  consume val router_state_step_ids_iso
+                built_state_steps(step_group) = router_state_steps
+
+                // Create HashedProxyRouters to other workers involved in this
+                // state computation step group.
+                // TODO: Currently, we simply include all workers in the
+                // cluster, but eventually we will need a more intelligent
+                // layout.
+                let proxies =
+                  recover iso Map[WorkerName, HashedProxyRouter] end
+                for (w, ob) in _outgoing_boundaries.pairs() do
+                  proxies(w) = HashedProxyRouter(w, ob, step_group, _auth)
+                end
+
+                let hash_partitions =
+                  if builder.local_routing() then
+                    HashPartitions([_worker_name])
+                  else
+                    HashPartitions(t.worker_names)
+                  end
+
+                let next_router = StatePartitionRouter(step_group,
+                  _worker_name, router_state_steps, router_state_step_ids,
+                  consume proxies, hash_partitions,
+                  t.step_group_routing_ids(step_group)?,
+                  builder.local_routing())
+
+                state_partition_routers(step_group) = next_router
+                built_routers(node_id) = next_router
+              else
+                //////////////////////////////////
+                // STATELESS COMPUTATION
+                let step_group: RoutingId = builder.routing_group()
+
+                /////////
+                // Create n steps given a parallelism of n. Then use these
+                // to create a StatelessPartitionRouter.
+                let step_group_steps = create_step_group(execution_ids,
+                  builder, out_router, _is_recovering)
+
+                // Now that we've built all the individual local steps in this
+                // group, we need to record that we built this group and
+                // then create the StatelessPartitionRouter that routes
+                // messages to it.
+                let router_stateless_steps_iso = recover iso Array[Step] end
+                let router_stateless_step_ids_iso =
+                  recover iso MapIs[Step, RoutingId] end
+                for (r_id, next_step) in step_group_steps.pairs() do
+                  router_stateless_steps_iso.push(next_step)
+                  router_stateless_step_ids_iso(next_step) = r_id
+                  data_routes(r_id) = next_step
+                  initializables.set(next_step)
+                end
+                let router_stateless_steps =
+                  consume val router_stateless_steps_iso
+                let router_stateless_step_ids =
+                  consume val router_stateless_step_ids_iso
+                built_stateless_steps(step_group) =
+                  router_stateless_steps
+
+                // Create proxies to other workers involved in this
+                // stateless computation step group.
+                // TODO: Currently, we simply include all workers in the
+                // cluster, but eventually we will need a more intelligent
+                // layout.
+                let proxies = recover iso Map[WorkerName, ProxyRouter] end
+                for (w, ob) in _outgoing_boundaries.pairs() do
+                  let w_routing_id =
+                    t.step_group_routing_ids(step_group)?(w)?
+                  let proxy_address = ProxyAddress(w, w_routing_id)
+                  let proxy_router = ProxyRouter(_worker_name, ob,
+                    proxy_address, _auth)
+                  proxies(w) = proxy_router
+                end
+
+                let stateless_partition_workers =
+                  if builder.local_routing() then
+                    recover val [_worker_name] end
+                  else
+                    t.worker_names
+                  end
+
+                let next_router = StatelessPartitionRouter(step_group,
+                  _worker_name, stateless_partition_workers,
+                  router_stateless_steps, router_stateless_step_ids,
+                  t.step_group_routing_ids(step_group)?,
+                  consume proxies, execution_ids.size())
+
+                stateless_partition_routers(step_group) = next_router
+                built_routers(node_id) = next_router
+              end
+            | let egress_builder: EgressBuilder =>
+            ////////////////////////////////////
+            // EGRESS BUILDER (Sink)
+            ////////////////////////////////////
+              let next_id = egress_builder.id()
+
+              let sink_reporter = MetricsReporter(t.name(), _worker_name,
+                _metrics_conn)
+
+              // TODO: We should be passing in a RoutingId from our
+              // execution ids list, but right now the SinkBuilder
+              // infrastructure doesn't allow that. This means that currently
+              // the same sink_id is attached to sink replicas across workers.
+              let sink = egress_builder(_worker_name, consume sink_reporter,
+                _event_log, _is_recovering, _barrier_coordinator,
+                _checkpoint_initiator, _env, _auth,
+                _outgoing_boundaries)
+
+              _connections.register_disposable(sink)
+              initializables.set(sink)
+
+              data_routes(next_id) = sink
+
+              let sink_router = DirectRouter(next_id, sink)
+              built_routers(next_id) = sink_router
+            | let multi_sink_builder: MultiSinkBuilder =>
+            ////////////////////////////////////
+            // MULTI SINK BUILDER
+            ////////////////////////////////////
+              let next_id = multi_sink_builder.id()
+              let routers = recover iso Array[Router] end
+              let sink_ids = Array[RoutingId]
+              for s_id in t.routing_ids()(next_id)?.values() do
+                sink_ids.push(s_id)
+              end
+              let sink_reporter = MetricsReporter(t.name(), _worker_name,
+                _metrics_conn)
+
+              let sinks = multi_sink_builder(_worker_name,
+                consume sink_reporter, _event_log, _is_recovering,
+                _barrier_coordinator, _checkpoint_initiator, _env, _auth,
+                _outgoing_boundaries)
+
+              for i in Range[USize](0, sinks.size()) do
+                let sink = sinks(i)?
+                let sink_id = sink_ids(i)?
+                _connections.register_disposable(sink)
+                initializables.set(sink)
+                data_routes(sink_id) = sink
+                let next_router = DirectRouter(sink_id, sink)
+                routers.push(next_router)
+              end
+
+              let sink_router = MultiRouter(consume routers)
+              built_routers(next_id) = sink_router
+            | let redundant_sink_builder: RedundantSinkBuilder =>
+            ////////////////////////////////////
+            // REDUNDANT SINK BUILDER
+            ////////////////////////////////////
+              let next_id = redundant_sink_builder.id()
+              let routers = recover iso Array[Router] end
+              let sink_ids = Array[RoutingId]
+              for s_id in t.routing_ids()(next_id)?.values() do
+                sink_ids.push(s_id)
+              end
+              let sink_reporter = MetricsReporter(t.name(), _worker_name,
+                _metrics_conn)
+
+              let sinks = redundant_sink_builder(_worker_name,
+                consume sink_reporter, _event_log, _is_recovering,
+                _barrier_coordinator, _checkpoint_initiator, _env, _auth,
+                _outgoing_boundaries)
+
+              for i in Range[USize](0, sinks.size()) do
+                let sink = sinks(i)?
+                let sink_id = sink_ids(i)?
+                _connections.register_disposable(sink)
+                initializables.set(sink)
+                data_routes(sink_id) = sink
+                let next_router = DirectRouter(sink_id, sink)
+                routers.push(next_router)
+              end
+
+              let sink_router = RedundantMultiRouter(consume routers)
+              built_routers(next_id) = sink_router
+            | let source_data: SourceData =>
+            /////////////////
+            // SOURCE DATA
+            /////////////////
+              let next_id = source_data.id()
+              let source_name = source_data.name()
+
+              let out_ids: Array[RoutingId] val =
+                try
+                  _get_output_node_ids(next_node)?
+                else
+                  @printf[I32]("Failed to get output node ids\n".cstring())
+                  error
+                end
+
+              // Determine router for outputs from this source.
+              let out_router =
+                if out_ids.size() > 0 then
+                  let routers = recover iso Array[Router] end
+                  for id in out_ids.values() do
+                    try
+                      routers.push(built_routers(id)?)
+                    else
+                      @printf[I32]("No router found to target\n".cstring())
+                      error
+                    end
+                  end
+                  ifdef debug then
+                    Invariant(routers.size() > 0)
+                  end
+                  if routers.size() == 1 then
+                    routers(0)?
+                  else
+                    MultiRouter(consume routers)
+                  end
+                else
+                  // There should be at least one output for a stateless
+                  // computation.
+                  Fail()
+                  EmptyRouter
+                end
+
+              // If there is no BarrierSource, we need to create one, since
+              // this worker has at least one Source on it.
+              if barrier_source is None then
+                let b_reporter = MetricsReporter(t.name(), _worker_name,
+                  _metrics_conn)
+                let b_source = BarrierSource(t.barrier_source_id,
+                  _router_registry, _event_log, consume b_reporter)
+                _barrier_coordinator.register_barrier_source(b_source)
+                barrier_source = b_source
+              end
+              try
+                (barrier_source as BarrierSource).register_source(
+                  source_name, out_router)
+              else
+                Unreachable()
+              end
+
+              let source_reporter = MetricsReporter(t.name(), _worker_name,
+                _metrics_conn)
+
+              let listen_auth = TCPListenAuth(_auth)
+              try
+                @printf[I32](("----Creating source " + source_name +
+                " with " + source_data.computations_name() + "----\n")
+                    .cstring())
+                let worker_source_config =
+                  _worker_source_configs(source_name)?
+                // Set up SourceCoordinator builders
+                let source_runner_builder = source_data.runner_builder()
+                let partitioner_builder = source_data.partitioner_builder()
+                // pass in list of workers
+                let sc_builder_builder =
+                  source_data.source_coordinator_builder_builder()
+                // TODO [post-source-migration]: add an existing-worker name
+                // That isn't currently joining so we can get registry leader
+                // (e.g. either initializer at startup or any one of the
+                // "non-joining" workers in a join)
+                let sc_builder = sc_builder_builder(_worker_name,
+                  source_name, source_runner_builder, partitioner_builder,
+                  out_router, _metrics_conn, consume source_reporter,
+                  _router_registry, _outgoing_boundary_builders, _event_log,
+                  _auth, this, _is_recovering, worker_source_config, _connections,
+                  t.worker_names, _is_joining)
+                _sc_builders.push(sc_builder)
+              else
+                Fail()
+              end
+
+              // Nothing connects to a source via an in edge locally,
+              // so this just marks that we've built this one
+              built_routers(next_id) = EmptyRouter
+            end
+            @printf[I32](("Finished handling " + next_node.value.name() +
+              " node\n").cstring())
+          else
+            nodes_to_initialize.push(next_node)
+          end
+        end
+        for b in _sc_builders.values() do
+          let ba = b.apply(_env)
+          initializables.set(ba)
+          _sc_actors.push(ba)
+        end
+
+        //////////////////////////////////////////////////////////////////////
+        // 3. Create DataRouter, register components with RouterRegistry,
+        //    and initiate final initialization Phases.
+
+        ////////////////////////////////////////////
+        // Set up the DataRouter for this worker
+        for (_, steps) in built_state_steps.pairs() do
+          for s in steps.values() do
+            _router_registry.register_producer(s)
+          end
+        end
+        for (_, steps) in built_stateless_steps.pairs() do
+          for s in steps.values() do
+            _router_registry.register_producer(s)
+          end
+        end
+
+        let sendable_data_routes = consume val data_routes
+
+        let sendable_step_group_steps_iso =
+          recover iso Map[RoutingId, Array[Step] val] end
+        for (k, v) in built_state_steps.pairs() do
+          sendable_step_group_steps_iso(k) = v
+        end
+        for (k, v) in built_stateless_steps.pairs() do
+          sendable_step_group_steps_iso(k) = v
+        end
+        let sendable_step_group_steps =
+          consume val sendable_step_group_steps_iso
+
+        let data_router_step_group_routing_ids =
+          recover iso Map[RoutingId, RoutingId] end
+        for (sr_id, ws) in t.step_group_routing_ids.pairs() do
+          for (w, r_id) in ws.pairs() do
+            if w == _worker_name then
+              data_router_step_group_routing_ids(r_id) = sr_id
+            end
+          end
+        end
+
+        let data_router = DataRouter(_worker_name, sendable_data_routes,
+          sendable_step_group_steps,
+          consume data_router_step_group_routing_ids)
+        _router_registry.set_data_router(data_router)
+
+        _data_receivers.update_data_router(data_router)
+
+        ////////////////////////////
+        // For non-initializers, inform the initializer that we're done
+        // initializing our local topology. If this is the initializer worker,
+        // we'll inform our ClusterInitializer actor once we've spun up the
+        // source listeners. Joining workers don't take part in this protocol.
+        if (not _is_initializer) and (not _is_joining) then
+          let topology_ready_msg =
+            try
+              ChannelMsgEncoder.topology_ready(_worker_name, _auth)?
+            else
+              @printf[I32]("ChannelMsgEncoder failed\n".cstring())
+              error
+            end
+
+          if not _is_recovering then
+            _connections.send_control("initializer", topology_ready_msg)
+          end
+        end
+
+        //////////////////////////////////////////////////////////////////
+        // Register boundaries and partition routers with RouterRegistry
+        _router_registry.register_boundaries(_outgoing_boundaries,
+          _outgoing_boundary_builders)
+
+        for (step_group, pr) in state_partition_routers.pairs() do
+          _router_registry.set_state_partition_router(step_group, pr)
+        end
+
+        for (id, pr) in stateless_partition_routers.pairs() do
+          _router_registry.set_stateless_partition_router(id, pr)
+        end
+
+        /////////////////////////////////////////
+        // Kick off final initialization Phases
+        _phase = _ApplicationBeginReportingPhase(this, initializables,
+          workers_ready_to_work)
+        _phase.begin_reporting()
+
+        @printf[I32]("Local topology initialized.\n".cstring())
+
+        if recovering_without_resilience then
+          _data_receivers.recovery_complete()
+        end
+      else
+        @printf[I32](("Local Topology Initializer: No local topology to " +
+          "initialize\n").cstring())
+      end
+
+      @printf[I32]("\n|^|^|^|Finished Initializing Local Topology|^|^|^|\n"
+        .cstring())
+      @printf[I32]("---------------------------------------------------------\n".cstring())
+    else
+      @printf[I32]("Error initializing topology!\n".cstring())
+      Fail()
+    end
+
+  fun create_step_group(routing_ids: SetIs[RoutingId] box,
+    builder: StepBuilder, output_router: Router, is_recovering: Bool):
+    Map[RoutingId, Step]
+  =>
+    let steps = Map[RoutingId, Step]
+    for r_id in routing_ids.values() do
+      let next_router = output_router.select_based_on_producer_id(r_id)
+      let next_step = builder(r_id, _worker_name, next_router,
+        _metrics_conn, _event_log, _recovery_replayer, _auth, _router_registry,
+        _outgoing_boundaries where is_recovering = is_recovering)
+
+      steps(r_id) = next_step
+      _connections.register_disposable(next_step)
+
+      // If our outputs are going to be routed through a
+      // StatePartitionRouter or StatelessPartitionRouter, then we
+      // need to subscribe to updates to that router.
+      // ASSUMPTION: If an out_router is a MultiRouter, then none
+      // of its subrouters are partition routers. Put differently,
+      // we assume that splits never include partition routers.
+      match output_router
+      | let pr: StatePartitionRouter =>
+        _router_registry
+          .register_partition_router_subscriber(pr.step_group(),
+            next_step)
+      | let pr: StatelessPartitionRouter =>
+        _router_registry
+          .register_stateless_partition_router_subscriber(
+            pr.partition_routing_id(), next_step)
+      end
+    end
+    steps
+
+  fun _is_ready_for_building(node: DagNode[ExecutionStageBuilder] val,
+    built_routers: Map[U128, Router]): Bool
+  =>
+    var is_ready = true
+    for out in node.outs() do
+      if not built_routers.contains(out.id) then is_ready = false end
+    end
+    is_ready
+
+  fun _get_output_node_ids(node: DagNode[ExecutionStageBuilder] val):
+    Array[RoutingId] val ?
+  =>
+    // Make sure this is not a sink or proxy node.
+    match node.value
+    | let eb: EgressBuilder =>
+      @printf[I32](("Sinks and Proxies have no output nodes in the local " +
+        "graph!\n").cstring())
+      error
+    end
+
+    var out_ids = recover iso Array[RoutingId] end
+    for out in node.outs() do
+      out_ids.push(out.id)
+    end
+    consume out_ids
+
+
+//////////////////////////
+// INITIALIZATION PHASES
+//////////////////////////
+  be report_created(initializable: Initializable) =>
+    _register_source_coordinators()
+    _phase.report_created(initializable)
+
+  fun ref _application_created(initializables: Initializables,
+    workers_ready_to_work: SetIs[WorkerName])
+  =>
+    _phase = _ApplicationCreatedPhase(this, initializables,
+      workers_ready_to_work)
+
+  be report_initialized(initializable: Initializable) =>
+    _phase.report_initialized(initializable)
+
+  fun ref _application_initialized(initializables: Initializables,
+    workers_ready_to_work: SetIs[WorkerName])
+  =>
+    _phase = _ApplicationInitializedPhase(this, initializables,
+      workers_ready_to_work)
+
+  be report_ready_to_work(initializable: Initializable) =>
+    _phase.report_ready_to_work(initializable)
+
+  fun ref _initializables_ready_to_work(initializables: Initializables,
+    workers_ready_to_work: SetIs[WorkerName])
+  =>
+    _phase = _InitializablesReadyToWorkPhase(this, initializables,
+      _recovery_ready_to_work, _event_log_ready_to_work,
+      workers_ready_to_work)
+
+    match _topology
+    | let t: LocalTopology =>
+      if _is_recovering and not _recovery_overridden then
+        _recovery.start_recovery(t.worker_names,
+          RecoveryReasons.crash_recovery())
+      else
+        _phase.report_recovery_ready_to_work()
+        _event_log.quick_initialize(this)
+      end
+      _router_registry.application_ready_to_work()
+      if _is_joining then
+        // Call this on router registry instead of Connections directly
+        // to make sure that other messages on registry queues are
+        // processed first
+        _router_registry.inform_contacted_worker_of_initialization(
+          t.step_group_routing_ids_for(_worker_name))
+      end
+    else
+      Fail()
+    end
+
+  be report_event_log_ready_to_work() =>
+    // !TODO!: Move handling of this into the phases.
+    _event_log_ready_to_work = true
+
+    _phase.report_event_log_ready_to_work()
+
+  be report_recovery_ready_to_work() =>
+    // !TODO!: Move handling of this into the phases.
+    _recovery_ready_to_work = true
+
+    _phase.report_recovery_ready_to_work()
+
+  fun ref send_worker_ready_to_work_report() =>
+    try
+      let msg = ChannelMsgEncoder.report_worker_ready_to_work(_worker_name,
+        _auth)?
+      _connections.send_control("initializer", msg)
+    else
+      Fail()
+    end
+
+  be worker_report_ready_to_work(w: WorkerName) =>
+    _phase.worker_report_ready_to_work(w)
+
+  be all_workers_ready_to_work() =>
+    _phase.all_workers_ready_to_work()
+
+  fun ref application_ready_to_work(initializables: Initializables,
+    workers_ready_to_work: SetIs[WorkerName])
+  =>
+    match _topology
+    | let t: LocalTopology =>
+      if _is_joining then
+        @printf[I32]("Joining worker: Skipping Phase III\n".cstring())
+        _cluster_ready_to_work(initializables)
+      elseif _is_recovering then
+        @printf[I32]("Recovering worker: Skipping Phase III\n".cstring())
+        _cluster_ready_to_work(initializables)
+      else
+        _phase = _ApplicationReadyToWorkPhase(this, initializables,
+          t.worker_names, workers_ready_to_work, _is_initializer)
+        _phase.worker_report_ready_to_work(_worker_name)
+      end
+    else
+      Fail()
+    end
+
+  fun ref _inform_cluster_all_workers_ready_to_work() =>
+    ifdef debug then Invariant(_is_initializer) end
+
+    match _topology
+    | let t: LocalTopology =>
+      try
+        let msg = ChannelMsgEncoder.all_workers_ready_to_work(_auth)?
+        for w in t.worker_names.values() do
+          if w != _worker_name then
+            _connections.send_control(w, msg)
+          end
+        end
+      else
+        Fail()
+      end
+    else
+      Fail()
+    end
+
+    match _cluster_initializer
+    | let ci: ClusterInitializer =>
+      ci.topology_ready("initializer")
+    else
+      @printf[I32](("Need ClusterInitializer to inform that topology is " +
+        "ready\n").cstring())
+    end
+
+  fun ref _cluster_ready_to_work(initializables: Initializables) =>
+    _phase = _ClusterReadyToWorkPhase(this, initializables)
+
+  fun ref _register_source_coordinators() =>
+    for sca in _sc_actors.values() do
+      _router_registry.register_source_coordinator(sca)
+    end
+
+///////////////////////
+// RESILIENCE
+///////////////////////
+  be rollback_local_keys(checkpoint_id: CheckpointId,
+    promise: Promise[None])
+  =>
+    @printf[I32]("Rolling back topology graph.\n".cstring())
+    let local_keys = _local_keys_file.read_local_keys(checkpoint_id)
+    _router_registry.rollback_keys(local_keys, promise)
+
+  be recover_and_initialize(ws: Array[WorkerName] val,
     cluster_initializer: (ClusterInitializer | None) = None)
   =>
-    _recovering = true
+    _is_recovering = true
     _recovered_worker_names = ws
 
     try
-      let data_channel_filepath = FilePath(_auth, _data_channel_file)
+      let data_channel_filepath = FilePath(_auth, _data_channel_file)?
       if not _is_initializer then
         let data_notifier: DataChannelListenNotify iso =
           DataChannelListenNotifier(_worker_name, _auth, _connections,
             _is_initializer,
-            MetricsReporter(_application.name(), _worker_name,
+            MetricsReporter(_app_name, _worker_name,
               _metrics_conn),
             data_channel_filepath, this, _data_receivers, _recovery_replayer,
-            _router_registry)
+            _autoscale, _router_registry, _the_journal, _do_local_file_io)
 
         _connections.make_and_register_recoverable_data_channel_listener(
           _auth, consume data_notifier, _router_registry,
@@ -413,15 +1269,33 @@ actor LocalTopologyInitializer is LayoutInitializer
         match cluster_initializer
         | let ci: ClusterInitializer =>
           _connections.create_initializer_data_channel_listener(
-            _data_receivers, _recovery_replayer, _router_registry, ci,
-            data_channel_filepath, this)
+            _data_receivers, _recovery_replayer, _autoscale, _router_registry,
+            ci, data_channel_filepath, this)
         end
       end
     else
       @printf[I32]("FAIL: cannot create data channel\n".cstring())
     end
 
-    _connections.recover_connections(this)
+  be register_key(step_group: RoutingId, key: Key,
+    checkpoint_id: (CheckpointId | None) = None)
+  =>
+    // We only add an entry to the local keys file if this is part of a
+    // checkpoint.
+    match checkpoint_id
+    | let c_id: CheckpointId =>
+      _local_keys_file.add_key(step_group, key, c_id)
+    end
+
+  be unregister_key(step_group: RoutingId, key: Key,
+    checkpoint_id: (CheckpointId | None) = None)
+  =>
+    // We only add an entry to the local keys file if this is part of a
+    // checkpoint.
+    match checkpoint_id
+    | let c_id: CheckpointId =>
+      _local_keys_file.remove_key(step_group, key, c_id)
+    end
 
   fun ref _save_worker_names()
   =>
@@ -433,8 +1307,9 @@ actor LocalTopologyInitializer is LayoutInitializer
       | let t: LocalTopology =>
         @printf[I32](("Saving worker names to file: " + _worker_names_file +
           "\n").cstring())
-        let worker_names_filepath = FilePath(_auth, _worker_names_file)
-        let file = File(worker_names_filepath)
+        let worker_names_filepath = FilePath(_auth, _worker_names_file)?
+        let file = AsyncJournalledFile(worker_names_filepath, _the_journal,
+          _auth, _do_local_file_io)
         // Clear file
         file.set_length(0)
         for worker_name in t.worker_names.values() do
@@ -444,6 +1319,8 @@ actor LocalTopologyInitializer is LayoutInitializer
         end
         file.sync()
         file.dispose()
+        // TODO: AsyncJournalledFile does not provide implicit sync semantics
+        // here
       else
         Fail()
       end
@@ -456,20 +1333,35 @@ actor LocalTopologyInitializer is LayoutInitializer
     | let t: LocalTopology =>
       @printf[I32]("Saving topology!\n".cstring())
       try
-        let local_topology_file = FilePath(_auth, _local_topology_file)
+        let local_topology_file = try
+          FilePath(_auth, _local_topology_file)?
+        else
+          @printf[I32]("Error opening topology file!\n".cstring())
+          Fail()
+          error
+        end
         // TODO: Back up old file before clearing it?
-        let file = File(local_topology_file)
+        let file = AsyncJournalledFile(local_topology_file, _the_journal,
+          _auth, _do_local_file_io)
         // Clear contents of file.
         file.set_length(0)
         let wb = Writer
         let sa = SerialiseAuth(_auth)
-        let s = Serialised(sa, t)
+        let s = try
+          Serialised(sa, t)?
+        else
+          @printf[I32]("Error serializing topology!\n".cstring())
+          Fail()
+          error
+        end
         let osa = OutputSerialisedAuth(_auth)
         let serialised_topology: Array[U8] val = s.output(osa)
         wb.write(serialised_topology)
         file.writev(recover val wb.done() end)
         file.sync()
         file.dispose()
+        // TODO: AsyncJournalledFile does not provide implicit sync semantics
+        // here
       else
         @printf[I32]("Error saving topology!\n".cstring())
         Fail()
@@ -479,1184 +1371,10 @@ actor LocalTopologyInitializer is LayoutInitializer
       Fail()
     end
 
-  be initialize(cluster_initializer: (ClusterInitializer | None) = None,
-    recovering: Bool = false)
-  =>
-    _recovering = recovering
 
-    if _is_joining then
-      _initialize_joining_worker()
-      return
-    end
-
-    @printf[I32](("------------------------------------------------------" +
-      "---\n").cstring())
-    @printf[I32]("|v|v|v|Initializing Local Topology|v|v|v|\n\n".cstring())
-    _cluster_initializer = cluster_initializer
-    try
-      try
-        let local_topology_file = FilePath(_auth, _local_topology_file)
-        if local_topology_file.exists() then
-          //we are recovering an existing worker topology
-          let data = recover val
-            let file = File(local_topology_file)
-            file.read(file.size())
-          end
-          match Serialised.input(InputSerialisedAuth(_auth), data)(
-            DeserialiseAuth(_auth))
-          | let t: LocalTopology val =>
-            _topology = t
-          else
-            @printf[I32]("error restoring previous topology!".cstring())
-          end
-        end
-      else
-        @printf[I32]("error restoring previous topology!".cstring())
-      end
-
-      match _topology
-      | let t: LocalTopology =>
-        let worker_count = t.worker_names.size()
-
-        if (worker_count > 1) and (_outgoing_boundaries.size() == 0) then
-          @printf[I32]("Outgoing boundaries not set up!\n".cstring())
-          error
-        end
-
-        _router_registry.set_pre_state_data(t.pre_state_data())
-
-        _save_local_topology()
-        _save_worker_names()
-
-        if t.is_empty() then
-          @printf[I32]("----This worker has no steps----\n".cstring())
-        end
-
-        let graph = t.graph()
-
-        @printf[I32]("Creating graph:\n".cstring())
-        @printf[I32]((graph.string() + "\n").cstring())
-
-        // Make sure we only create shared state once and reuse it
-        let state_map: Map[String, Router] = state_map.create()
-
-        @printf[I32](("\nInitializing " + t.name() +
-          " application locally:\n\n").cstring())
-
-        // For passing into partition builders so they can add state steps
-        // to our data routes
-        let data_routes_ref = Map[U128, Consumer]
-
-        // Keep track of all Consumers by id so we can create a
-        // DataRouter for the data channel boundary
-        var data_routes = recover trn Map[U128, Consumer] end
-
-        // Update the step ids for all OutgoingBoundaries
-        if worker_count > 1 then
-          _connections.update_boundary_ids(t.proxy_ids())
-        end
-
-        // Keep track of routers to the steps we've built
-        let built_routers = Map[U128, Router]
-
-        // Keep track of steps we've built that we'll use for the OmniRouter.
-        // Unlike data_routes, these will not include state steps, which will
-        // never be direct targets for state computation outputs.
-        let built_stateless_steps = recover trn Map[U128, Consumer] end
-
-        // TODO: Replace this when we move past the temporary POC based default
-        // target strategy. There can currently only be one partition default
-        // target per topology.
-        var default_step_initializer: (StepInitializer | None) = None
-        var default_in_route_builder: (RouteBuilder | None) = None
-        var default_target: (Step | None) = None
-        var default_target_id: U128 = t.default_target_id
-        var default_target_state_step_id: StepId = 0
-        var default_target_state_step: (Step | None) = None
-        match t.default_target
-        | let targets: Array[StepBuilder] val =>
-          @printf[I32]("A default target exists!\n".cstring())
-          let pre_state_initializer =
-            try
-              targets(0)
-            else
-              @printf[I32]("No StepInitializer for prestate default target\n"
-                .cstring())
-              error
-            end
-
-          default_step_initializer = pre_state_initializer
-          default_in_route_builder = pre_state_initializer.in_route_builder()
-
-          let state_builder =
-            try
-              targets(1)
-            else
-              @printf[I32]("No StepInitializer for state default target\n"
-                .cstring())
-              error
-            end
-          default_target_state_step_id = state_builder.id()
-
-          let state_step = state_builder(EmptyRouter, _metrics_conn,
-            _event_log, _recovery_replayer, _auth, _outgoing_boundaries)
-          state_step.update_route_builder(
-            state_builder.forward_route_builder())
-
-          default_target_state_step = state_step
-          _initializables.set(state_step)
-
-          let state_step_router = DirectRouter(state_step)
-          built_routers(default_target_state_step_id) = state_step_router
-          state_map(t.default_state_name) = state_step_router
-        | let proxy_target: ProxyAddress =>
-          let proxy_router =
-            try
-              ProxyRouter(_worker_name,
-                _outgoing_boundaries(proxy_target.worker), proxy_target, _auth)
-            else
-              @printf[I32]("Can't find outgoing boundary for %s\n".cstring(),
-                proxy_target.worker.cstring())
-              error
-            end
-          built_routers(default_target_id) = proxy_router
-        end
-
-        /////////
-        // Initialize based on DAG
-        //
-        // Assumptions:
-        //   I. Acylic graph
-        //   II. No splits (only joins), ignoring partitions
-        //   III. No direct chains of different partitions
-        /////////
-
-        let frontier = Array[DagNode[StepInitializer] val]
-
-        /////////
-        // 1. Find graph sinks and add to frontier queue.
-        //    We'll work our way backwards.
-        @printf[I32]("Adding sink nodes to frontier\n".cstring())
-
-        // Hold non_partitions until the end because we need to build state
-        // comp targets first. (Holding to the end means processing first,
-        // since we're pushing onto a stack). On the other hand, we
-        // put all source data nodes on the bottom of the stack since
-        // sources should be processed last.
-        let non_partitions = Array[DagNode[StepInitializer] val]
-        let source_data_nodes = Array[DagNode[StepInitializer] val]
-        for node in graph.nodes() do
-          match node.value
-          | let sd: SourceData =>
-            source_data_nodes.push(node)
-          else
-            if node.is_sink() and node.value.is_prestate() then
-              @printf[I32](("Adding " + node.value.name() +
-                " node to frontier\n").cstring())
-              frontier.push(node)
-            else
-              non_partitions.push(node)
-            end
-          end
-        end
-
-        for node in non_partitions.values() do
-          @printf[I32](("Adding " + node.value.name() + " node to frontier\n")
-            .cstring())
-          frontier.push(node)
-        end
-
-        for node in source_data_nodes.values() do
-          @printf[I32](("Adding " + node.value.name() +
-            " node to end of frontier\n").cstring())
-          frontier.unshift(node)
-        end
-
-        /////////
-        // 2. Loop: Check next frontier item for if all outgoing steps have
-        //          been created
-        //       if no, send to bottom of frontier stack.
-        //       if yes, add ins to frontier stack, then build the step
-        //       (connecting it to its out step, which has already been built)
-        // If there are no cycles (I), this will terminate
-        while frontier.size() > 0 do
-          let next_node =
-            try
-              frontier.pop()
-            else
-              @printf[I32](("Graph frontier stack was empty when node was " +
-                "still expected\n").cstring())
-              error
-            end
-
-          if built_routers.contains(next_node.id) then
-            // We've already handled this node (probably because it's
-            // pre-state)
-            // TODO: I don't think this should ever happen.
-            @printf[I32](("We've already handled " + next_node.value.name() +
-              " with id " + next_node.id.string() + " so we're not handling " +
-              " it again\n").cstring())
-            continue
-          end
-
-          // We are only ready to build a node if all of its outputs
-          // have been built (though currently, because there are no
-          // splits (II), there will only be at most one output per node)
-          if _is_ready_for_building(next_node, built_routers) then
-            @printf[I32](("Handling " + next_node.value.name() + " node\n")
-              .cstring())
-            let next_initializer: StepInitializer = next_node.value
-
-            // ...match kind of initializer and go from there...
-            match next_initializer
-            | let builder: StepBuilder =>
-            ///////////////
-            // STEP BUILDER
-            ///////////////
-              let next_id = builder.id()
-              @printf[I32](("Handling id " + next_id.string() + "\n")
-                .cstring())
-
-              if builder.is_prestate() then
-              ///////////////////
-              // PRESTATE BUILDER
-                @printf[I32](("----Spinning up " + builder.name() + "----\n")
-                  .cstring())
-
-                // TODO: Change this when we implement post-POC default
-                // strategy
-                let dsn = builder.default_state_name()
-                let default_router =
-                  match default_step_initializer
-                  | let dsinit: StepBuilder =>
-                    if (dsn != "") and (dsn == t.default_state_name) then
-                      // We need a default router
-                      let default_state_router =
-                        try
-                          state_map(dsn)
-                        else
-                          @printf[I32](("Default state router not found in " +
-                            "state_map\n").cstring())
-                          error
-                        end
-
-                      let default_pre_state_id = dsinit.id()
-                      let default_pre_state_step =
-                        dsinit(default_state_router,
-                          _metrics_conn, _event_log, _recovery_replayer, _auth,
-                          _outgoing_boundaries)
-                      default_target = default_pre_state_step
-                      _initializables.set(default_pre_state_step)
-                      built_stateless_steps(default_pre_state_id) =
-                        default_pre_state_step
-                      data_routes(default_pre_state_id) =
-                        default_pre_state_step
-                      let router = DirectRouter(default_pre_state_step)
-                      built_routers(default_pre_state_id) = router
-                      router
-                    else
-                      None
-                    end
-                  else
-                    None
-                  end
-
-                ////
-                // Create the state partition if it doesn't exist
-                if builder.state_name() != "" then
-                  try
-                    t.update_state_map(builder.state_name(), state_map,
-                      _metrics_conn, _event_log, _recovery_replayer, _auth,
-                      _outgoing_boundaries, _initializables,
-                      data_routes_ref, default_router)
-                  else
-                    @printf[I32]("Failed to update state_map\n".cstring())
-                    error
-                  end
-                end
-
-                let partition_router =
-                  try
-                    builder.clone_router_and_set_input_type(
-                      state_map(builder.state_name()), default_router)
-                  else
-                    // Not a partition, so we need a direct target router
-                    @printf[I32](("No partition router found for " +
-                      builder.state_name() + "\n").cstring())
-                    error
-                  end
-
-                let state_comp_target_router =
-                  match builder.pre_state_target_id()
-                  | let id: U128 =>
-                    try
-                      built_routers(id)
-                    else
-                      @printf[I32]("No router found to prestate target step\n"
-                        .cstring())
-                      error
-                    end
-                  else
-                    // This prestate has no computation target
-                    EmptyRouter
-                  end
-
-                let next_step = builder(partition_router, _metrics_conn,
-                  _event_log, _recovery_replayer, _auth, _outgoing_boundaries,
-                  state_comp_target_router)
-                _router_registry.register_partition_router_step(next_step)
-
-                data_routes(next_id) = next_step
-                _initializables.set(next_step)
-
-                built_stateless_steps(next_id) = next_step
-                let next_router = DirectRouter(next_step)
-                built_routers(next_id) = next_router
-              elseif not builder.is_stateful() then
-              //////////////////////////////////
-              // STATELESS, NON-PRESTATE BUILDER
-                @printf[I32](("----Spinning up " + builder.name() + "----\n")
-                  .cstring())
-                // Currently there are no splits (II), so we know that a node
-                // has only one output in the graph. We also know this is not
-                // a sink or proxy, so there is at most one output.
-                let out_id: (U128 | None) =
-                  try
-                    match _get_output_node_id(next_node,
-                      default_target_id, default_target_state_step_id)
-                    | let id: U128 => id
-                    else
-                      None
-                    end
-                  else
-                    @printf[I32]("Failed to get output node id\n".cstring())
-                    error
-                  end
-
-                let out_router =
-                  match out_id
-                  | let id: U128 =>
-                    try
-                      builder.clone_router_and_set_input_type(
-                        built_routers(id))
-                    else
-                      @printf[I32](("Invariant was violated: node was not " +
-                        "built before one of its inputs.\n").cstring())
-                      error
-                    end
-                  else
-                    EmptyRouter
-                  end
-
-                // Check if this is a default target.  If so, route it
-                // to the appropriate default state step.
-                let next_step = builder(out_router, _metrics_conn, _event_log,
-                _recovery_replayer, _auth, _outgoing_boundaries)
-
-                data_routes(next_id) = next_step
-                _initializables.set(next_step)
-
-                built_stateless_steps(next_id) = next_step
-                let next_router = DirectRouter(next_step)
-                built_routers(next_id) = next_router
-
-                // If this is our default target, then keep a reference
-                // to it
-                if next_id == default_target_id then
-                  default_target = next_step
-                end
-              else
-              ////////////////////////////////
-              // NON-PARTITIONED STATE BUILDER
-                // Our step is stateful and non-partitioned, so we need to
-                // build both a state step and a prestate step
-
-                // First, we must check that all state computation targets
-                // have been built.  If they haven't, then we send this node
-                // to the back of the frontier queue (it will eventually
-                // be processed because of no splits (II))
-                var targets_ready = true
-                for in_node in next_node.ins() do
-                  match in_node.value.pre_state_target_id()
-                  | let id: U128 =>
-                    try
-                      built_routers(id)
-                    else
-                      targets_ready = false
-                    end
-                  end
-                end
-
-                if not targets_ready then
-                  frontier.unshift(next_node)
-                  continue
-                end
-
-                @printf[I32](("----Spinning up state for " + builder.name() +
-                  "----\n").cstring())
-                let state_step = builder(EmptyRouter, _metrics_conn,
-                  _event_log, _recovery_replayer, _auth, _outgoing_boundaries)
-                data_routes(next_id) = state_step
-                _initializables.set(state_step)
-
-                let state_step_router = DirectRouter(state_step)
-                built_routers(next_id) = state_step_router
-
-                // Before a non-partitioned state builder, we should
-                // always have one or more non-partitioned pre-state builders.
-                // The only inputs coming into a state builder should be
-                // prestate builder, so we're going to build them all
-                for in_node in next_node.ins() do
-                  match in_node.value
-                  | let b: StepBuilder =>
-                    @printf[I32](("----Spinning up " + b.name() + "----\n")
-                      .cstring())
-
-                    let state_comp_target =
-                      match b.pre_state_target_id()
-                      | let id: U128 =>
-                        try
-                          built_routers(id)
-                        else
-                          @printf[I32](("Prestate comp target not built! We " +
-                            "should have already caught this\n").cstring())
-                          error
-                        end
-                      else
-                        @printf[I32](("There is no prestate comp target. " +
-                          "using an EmptyRouter\n").cstring())
-                        EmptyRouter
-                      end
-
-                    let pre_state_step = b(state_step_router, _metrics_conn,
-                      _event_log, _recovery_replayer, _auth,
-                      _outgoing_boundaries, state_comp_target)
-                    data_routes(b.id()) = pre_state_step
-                    _initializables.set(pre_state_step)
-
-                    built_stateless_steps(b.id()) = pre_state_step
-                    let pre_state_router = DirectRouter(pre_state_step)
-                    built_routers(b.id()) = pre_state_router
-
-                    state_step.register_routes(state_comp_target,
-                      b.forward_route_builder())
-
-                    // Add ins to this prestate node to the frontier
-                    for in_in_node in in_node.ins() do
-                      if not built_routers.contains(in_in_node.id) then
-                        frontier.push(in_in_node)
-                      end
-                    end
-
-                    @printf[I32](("Finished handling " + in_node.value.name() +
-                      " node\n").cstring())
-                  else
-                    @printf[I32](("State steps should only have prestate " +
-                      "predecessors!\n").cstring())
-                    error
-                  end
-                end
-              end
-            | let egress_builder: EgressBuilder =>
-            ////////////////////////////////////
-            // EGRESS BUILDER (Sink or Boundary)
-            ////////////////////////////////////
-              let next_id = egress_builder.id()
-              if not built_routers.contains(next_id) then
-                let sink_reporter = MetricsReporter(t.name(),
-                  t.worker_name(),
-                  _metrics_conn)
-
-                // Create a sink or OutgoingBoundary proxy. If the latter,
-                // egress_builder finds it from _outgoing_boundaries
-                let sink =
-                  try
-                    egress_builder(_worker_name,
-                      consume sink_reporter, _auth, _outgoing_boundaries)
-                  else
-                    @printf[I32]("Failed to build sink from egress_builder\n"
-                      .cstring())
-                    error
-                  end
-
-                match sink
-                | let d: DisposableActor =>
-                  _connections.register_disposable(d)
-                else
-                  @printf[I32](("All sinks and boundaries should be " +
-                    "disposable!\n").cstring())
-                  Fail()
-                end
-
-                if not _initializables.contains(sink) then
-                  _initializables.set(sink)
-                end
-
-                let sink_router =
-                  match sink
-                  | let ob: OutgoingBoundary =>
-                    match egress_builder.target_address()
-                    | let pa: ProxyAddress =>
-                      ProxyRouter(_worker_name, ob, pa, _auth)
-                    else
-                      @printf[I32]("No ProxyAddress for proxy!\n".cstring())
-                      error
-                    end
-                  else
-                    DirectRouter(sink)
-                  end
-
-                built_stateless_steps(next_id) = sink
-                data_routes(next_id) = sink
-                built_routers(next_id) = sink_router
-              end
-            | let pre_stateless_data: PreStatelessData =>
-            //////////////////////
-            // PRE-STATELESS DATA
-            //////////////////////
-              try
-                let local_step_ids =
-                  pre_stateless_data.worker_to_step_id(_worker_name)
-
-                // Make sure all local steps for this stateless partition
-                // have already been initialized on this worker.
-                var ready = true
-                for id in local_step_ids.values() do
-                  if not built_stateless_steps.contains(id) then
-                    ready = false
-                  end
-                end
-
-                if ready then
-                  // Populate partition routes with all local steps in
-                  // the partition and proxy routers for any steps that
-                  // exist on other workers.
-                  let partition_routes =
-                    recover trn Map[U64, (Step | ProxyRouter)] end
-
-                  for (p_id, step_id) in
-                    pre_stateless_data.partition_id_to_step_id.pairs()
-                  do
-                    if local_step_ids.contains(step_id) then
-                      match built_stateless_steps(step_id)
-                      | let s: Step =>
-                        partition_routes(p_id) = s
-                      else
-                        @printf[I32](("We should only be creating stateless " +
-                          "partition routes to Steps!\n").cstring())
-                        Fail()
-                      end
-                    else
-                      let target_worker =
-                        pre_stateless_data.partition_id_to_worker(p_id)
-                      let proxy_address = ProxyAddress(target_worker, step_id)
-
-                      partition_routes(p_id) = ProxyRouter(target_worker,
-                        _outgoing_boundaries(target_worker),
-                        proxy_address, _auth)
-                    end
-                  end
-
-                  let stateless_partition_router =
-                    LocalStatelessPartitionRouter(
-                      pre_stateless_data.partition_id_to_step_id,
-                      consume partition_routes)
-
-                  built_routers(next_node.id) = stateless_partition_router
-                else
-                  // We need to wait until all local stateless partition steps
-                  // are spun up on this worker before we can create the
-                  // LocalStatelessPartitionRouter
-                  frontier.unshift(next_node)
-                end
-              else
-                @printf[I32]("Error spinning up stateless partition\n"
-                  .cstring())
-                Fail()
-              end
-            | let source_data: SourceData =>
-            /////////////////
-            // SOURCE DATA
-            /////////////////
-              let next_id = source_data.id()
-              let pipeline_name = source_data.pipeline_name()
-
-              // TODO: Change this when we implement post-POC default
-              // strategy
-              let dsn = source_data.default_state_name()
-              let default_router =
-                match default_step_initializer
-                | let dsinit: StepBuilder =>
-                  if (dsn != "") and (dsn == t.default_state_name) then
-                    // We need a default router
-                    let default_state_router =
-                      try
-                        state_map(dsn)
-                      else
-                        @printf[I32](("Failed to find default state router " +
-                          "in state_map\n").cstring())
-                        error
-                      end
-
-                    let default_pre_state_id = dsinit.id()
-                    let default_pre_state_step =
-                      dsinit(default_state_router, _metrics_conn, _event_log,
-                        _recovery_replayer, _auth, _outgoing_boundaries)
-                    default_target = default_pre_state_step
-                    _initializables.set(default_pre_state_step)
-                    built_stateless_steps(default_pre_state_id) =
-                      default_pre_state_step
-                    data_routes(default_pre_state_id) = default_pre_state_step
-                    let router = DirectRouter(default_pre_state_step)
-                    built_routers(default_pre_state_id) = router
-                    router
-                  else
-                    None
-                  end
-                else
-                  None
-                end
-
-              ////
-              // Create the state partition if it doesn't exist
-              if source_data.state_name() != "" then
-                try
-                  t.update_state_map(source_data.state_name(), state_map,
-                    _metrics_conn, _event_log, _recovery_replayer, _auth,
-                    _outgoing_boundaries, _initializables,
-                    data_routes_ref, default_router)
-                else
-                  @printf[I32]("Failed to update state map\n".cstring())
-                  error
-                end
-              end
-
-              let state_comp_target_router =
-                if source_data.is_prestate() then
-                  match source_data.pre_state_target_id()
-                  | let id: U128 =>
-                    try
-                      built_routers(id)
-                    else
-                      @printf[I32](("Prestate comp target not built! We " +
-                        "should have already caught this\n").cstring())
-                      error
-                    end
-                  else
-                    @printf[I32](("There is no prestate comp target. Using " +
-                      "an EmptyRouter\n").cstring())
-                    EmptyRouter
-                  end
-                else
-                  EmptyRouter
-                end
-
-              let out_router =
-                if source_data.state_name() == "" then
-                  // Currently there are no splits (II), so we know that a
-                  // node has only one output in the graph. We also know this
-                  // is not a sink or proxy, so there is exactly one output.
-                  let out_id: (U128 | None) =
-                    try
-                      _get_output_node_id(next_node,
-                        default_target_id, default_target_state_step_id)
-                    else
-                      @printf[I32]("Failed to get output node id\n".cstring())
-                      error
-                    end
-
-                  match out_id
-                  | let id: U128 => id
-                    try
-                      built_routers(id)
-                    else
-                      @printf[I32](("Invariant was violated: node was not " +
-                        "built before one of its inputs.\n").cstring())
-                      error
-                    end
-                  else
-                    EmptyRouter
-                  end
-                else
-                  // Source has a prestate runner on it, so we have no
-                  // direct target. We need a partition router. And we
-                  // need to register a route to our state comp target on those
-                  // state steps.
-                  try
-                    source_data.clone_router_and_set_input_type(
-                      state_map(source_data.state_name()), default_router)
-                  else
-                    @printf[I32]("State doesn't exist for state computation.\n"
-                      .cstring())
-                    error
-                  end
-                end
-
-              let source_reporter = MetricsReporter(t.name(),
-                t.worker_name(),
-                _metrics_conn)
-
-              let listen_auth = TCPListenAuth(_auth)
-              @printf[I32](("----Creating source for " + pipeline_name +
-                " pipeline with " + source_data.name() + "----\n").cstring())
-
-              sl_builders.push(source_data.source_listener_builder_builder()(
-                source_data.builder()(source_data.runner_builder(),
-                  out_router, _metrics_conn,
-                  source_data.pre_state_target_id(), t.worker_name(),
-                  source_reporter.clone()),
-                out_router, _router_registry,
-                source_data.route_builder(),
-                _outgoing_boundary_builders,
-                _event_log, _auth, this,  consume source_reporter,
-                default_target, default_in_route_builder,
-                state_comp_target_router))
-
-              // Nothing connects to a source via an in edge locally,
-              // so this just marks that we've built this one
-              built_routers(next_id) = EmptyRouter
-            end
-
-            // Add all the nodes with incoming edges to next_node to the
-            // frontier
-            for in_node in next_node.ins() do
-              if not built_routers.contains(in_node.id) then
-                frontier.push(in_node)
-              end
-            end
-
-            @printf[I32](("Finished handling " + next_node.value.name() +
-              " node\n").cstring())
-          else
-            frontier.unshift(next_node)
-          end
-        end
-
-        /////
-        // Register pre state target routes on corresponding state steps
-        for psd in t.pre_state_data().values() do
-          match psd.target_id()
-          | let tid: U128 =>
-            // If the corresponding state has not been built yet, build it
-            // now
-            // TODO: Do we need a default router here?
-            if psd.is_default_target() then
-              match default_target_state_step
-              | let ds: Step =>
-                let target_router =
-                  try
-                    built_routers(tid)
-                  else
-                    @printf[I32]("Failed to build router for default target\n"
-                      .cstring())
-                    error
-                  end
-                ds.register_routes(target_router, psd.forward_route_builder())
-              else
-                @printf[I32]("Default targets are not built on this worker\n"
-                  .cstring())
-              end
-            else
-              if psd.state_name() != "" then
-                try
-                  t.update_state_map(psd.state_name(), state_map,
-                    _metrics_conn, _event_log, _recovery_replayer, _auth,
-                    _outgoing_boundaries, _initializables,
-                    data_routes_ref, None)
-                else
-                  @printf[I32]("Failed to update state map\n".cstring())
-                  error
-                end
-              end
-              let partition_router =
-                try
-                  psd.clone_router_and_set_input_type(state_map(
-                    psd.state_name()))
-                else
-                  @printf[I32](("PartitionRouter was not built for expected " +
-                    "state partition.\n").cstring())
-                  error
-                end
-              let target_router =
-                try
-                  built_routers(tid)
-                else
-                  @printf[I32](("Failed to find built router for " +
-                    "target_router\n").cstring())
-                  error
-                end
-              match partition_router
-              | let pr: PartitionRouter =>
-                _router_registry.set_partition_router(psd.state_name(), pr)
-                pr.register_routes(target_router, psd.forward_route_builder())
-                @printf[I32](("Registered routes on state steps for " +
-                  psd.pre_state_name() + "\n").cstring())
-              else
-                @printf[I32](("Expected PartitionRouter but found something " +
-                  "else!\n").cstring())
-                error
-              end
-            end
-          end
-        end
-        /////
-
-        for (k, v) in data_routes_ref.pairs() do
-          data_routes(k) = v
-        end
-
-        let data_router = DataRouter(consume data_routes)
-        _router_registry.set_data_router(data_router)
-
-        if not _is_initializer then
-          // Inform the initializer that we're done initializing our local
-          // topology. If this is the initializer worker, we'll inform
-          // our ClusterInitializer actor once we've spun up the source
-          // listeners.
-          let topology_ready_msg =
-            try
-              ChannelMsgEncoder.topology_ready(_worker_name, _auth)
-            else
-              @printf[I32]("ChannelMsgEncoder failed\n".cstring())
-              error
-            end
-
-          if not recovering then
-            _connections.send_control("initializer", topology_ready_msg)
-
-            let ready_msg = ExternalMsgEncoder.ready(_worker_name)
-            _connections.send_phone_home(ready_msg)
-          end
-        end
-
-        _router_registry.register_boundaries(_outgoing_boundaries,
-          _outgoing_boundary_builders)
-
-        let omni_router = StepIdRouter(_worker_name,
-          consume built_stateless_steps, t.step_map(), _outgoing_boundaries)
-        _router_registry.set_omni_router(omni_router)
-
-        // Initialize all our initializables to get backpressure started
-        _omni_router = omni_router
-        for i in _initializables.values() do
-          i.application_begin_reporting(this)
-        end
-
-        @printf[I32]("Local topology initialized\n".cstring())
-        _topology_initialized = true
-
-        if _initializables.size() == 0 then
-          @printf[I32](("Phases I-II skipped (this topology must only have " +
-            "sources.)\n").cstring())
-          _application_ready_to_work()
-        end
-      else
-        @printf[I32](("Local Topology Initializer: No local topology to " +
-          "initialize\n").cstring())
-      end
-
-      @printf[I32]("\n|^|^|^|Finished Initializing Local Topology|^|^|^|\n"
-        .cstring())
-      @printf[I32]("---------------------------------------------------------\n".cstring())
-
-    else
-      @printf[I32]("Error initializing local topology\n".cstring())
-      Fail()
-    end
-
-  fun ref _initialize_joining_worker() =>
-    @printf[I32]("---------------------------------------------------------\n".cstring())
-    @printf[I32]("|v|v|v|Initializing Joining Worker Local Topology|v|v|v|\n\n"
-      .cstring())
-    try
-      let built_routers = Map[U128, Router]
-      let data_routes = recover trn Map[U128, Consumer] end
-      let built_stateless_steps = recover trn Map[U128, Consumer] end
-
-      match _topology
-      | let t: LocalTopology =>
-        _router_registry.set_pre_state_data(t.pre_state_data())
-        // Create sinks
-        for node in t.graph().nodes() do
-          match node.value
-          | let egress_builder: EgressBuilder =>
-            let next_id = egress_builder.id()
-            if not built_routers.contains(next_id) then
-              let sink_reporter = MetricsReporter(t.name(),
-                t.worker_name(), _metrics_conn)
-
-              // Create a sink or OutgoingBoundary. If the latter,
-              // egress_builder finds it from _outgoing_boundaries
-              let sink = egress_builder(_worker_name,
-                consume sink_reporter, _auth, _outgoing_boundaries)
-
-              match sink
-              | let d: DisposableActor =>
-                _connections.register_disposable(d)
-              else
-                @printf[I32](("All sinks and boundaries should be " +
-                  "disposable!\n").cstring())
-                Fail()
-              end
-
-              if not _initializables.contains(sink) then
-                _initializables.set(sink)
-              end
-
-              let sink_router =
-                match sink
-                | let ob: OutgoingBoundary =>
-                  match egress_builder.target_address()
-                  | let pa: ProxyAddress =>
-                    ProxyRouter(_worker_name, ob, pa, _auth)
-                  else
-                    @printf[I32]("No ProxyAddress for proxy!\n".cstring())
-                    error
-                  end
-                else
-                  DirectRouter(sink)
-                end
-
-              data_routes(next_id) = sink
-              built_routers(next_id) = sink_router
-              built_stateless_steps(next_id) = sink
-            end
-          else
-            @printf[I32](("Joining worker only currently supports sinks for " +
-              "initial topology\n").cstring())
-            Fail()
-          end
-        end
-
-        let data_router = DataRouter(consume data_routes)
-        _router_registry.set_data_router(data_router)
-
-        _router_registry.register_boundaries(_outgoing_boundaries,
-          _outgoing_boundary_builders)
-
-        let omni_router = StepIdRouter(_worker_name,
-          consume built_stateless_steps, t.step_map(), _outgoing_boundaries)
-        _router_registry.set_omni_router(omni_router)
-        _omni_router = omni_router
-
-        for (state_name, subpartition) in t.state_builders().pairs() do
-          let partition_router = subpartition.build(_application.name(),
-            _worker_name, _metrics_conn, _auth, _event_log, _recovery_replayer,
-            _outgoing_boundaries, _initializables,
-            recover Map[U128, Consumer] end where default_router = None)
-          _router_registry.set_partition_router(state_name, partition_router)
-        end
-
-        _save_local_topology()
-        _save_worker_names()
-
-        // Call this on router registry instead of Connections directly
-        // to make sure that other messages on registry queues are
-        // processed first
-        _router_registry.inform_cluster_of_join()
-
-        @printf[I32](("\n|^|^|^|Finished Initializing Joining Worker Local " +
-          "Topology|^|^|^|\n").cstring())
-        @printf[I32]("---------------------------------------------------------\n".cstring())
-
-        @printf[I32]("***Successfully joined cluster!***\n".cstring())
-      else
-        Fail()
-      end
-    else
-      Fail()
-    end
-
-  be update_state_step_entry[Key: (Hashable val & Equatable[Key] val)](
-    state_name: String, key: Key, pa: ProxyAddress) =>
-    try
-      match _topology
-      | let t: LocalTopology =>
-        _topology = t.update_proxy_address_for_state_key[Key](state_name,
-        key, pa)
-        // TODO: We should find a way to batch changes before writing out.
-        _save_local_topology()
-      end
-    else
-      Fail()
-    end
-
-  be receive_immigrant_step(msg: StepMigrationMsg) =>
-    try
-      match _topology
-      | let t: LocalTopology =>
-        let subpartition = t.state_builders()(msg.state_name())
-        let runner_builder = subpartition.runner_builder()
-        let reporter = MetricsReporter(t.name(), t.worker_name(),
-          _metrics_conn)
-        let step = Step(runner_builder(where event_log = _event_log,
-          auth = _auth), consume reporter, msg.step_id(),
-          runner_builder.route_builder(), _event_log, _recovery_replayer,
-          _outgoing_boundaries)
-        step.receive_state(msg.state())
-        msg.update_router_registry(_router_registry, step)
-      else
-        Fail()
-      end
-    else
-      Fail()
-    end
-
-  be report_created(initializable: Initializable) =>
-    if not _created.contains(initializable) then
-      match _omni_router
-      | let o_router: OmniRouter =>
-        _created.set(initializable)
-        if _created.size() == _initializables.size() then
-          @printf[I32]("|~~ INIT PHASE I: Application is created! ~~|\n"
-            .cstring())
-          _spin_up_source_listeners()
-          for i in _initializables.values() do
-            i.application_created(this, o_router)
-            match i
-            | let s: Step =>
-              _router_registry.register_omni_router_step(s)
-            end
-          end
-        end
-      else
-        Fail()
-      end
-    else
-      @printf[I32]("The same Initializable reported being created twice\n"
-        .cstring())
-      Fail()
-    end
-
-  be report_initialized(initializable: Initializable) =>
-    if not _initialized.contains(initializable) then
-      _initialized.set(initializable)
-      if _initialized.size() == _initializables.size() then
-        @printf[I32]("|~~ INIT PHASE II: Application is initialized! ~~|\n"
-          .cstring())
-        for i in _initializables.values() do
-          i.application_initialized(this)
-        end
-      end
-    else
-      @printf[I32]("The same Initializable reported being initialized twice\n"
-        .cstring())
-      Fail()
-    end
-
-  be report_ready_to_work(initializable: Initializable) =>
-    if not _ready_to_work.contains(initializable) then
-      _ready_to_work.set(initializable)
-      if _ready_to_work.size() == _initializables.size() then
-        if _recovering then
-          match _topology
-          | let t: LocalTopology =>
-            _recovery.start_recovery(this, t.worker_names)
-          else
-            Fail()
-          end
-        else
-          _event_log.start_pipeline_logging(this)
-        end
-        _router_registry.application_ready_to_work()
-      end
-    else
-      @printf[I32](("The same Initializable reported being ready to work " +
-        "twice\n").cstring())
-      Fail()
-    end
-
-  be report_event_log_ready_to_work() =>
-    // This should only get called after all initializables have reported
-    // they are ready to work, at which point we would have told the EventLog
-    // to start pipeline logging.
-    if _ready_to_work.size() == _initializables.size() then
-      _application_ready_to_work()
-    else
-      Fail()
-    end
-
-  fun ref _application_ready_to_work() =>
-    @printf[I32]("|~~ INIT PHASE III: Application is ready to work! ~~|\n"
-      .cstring())
-    for i in _initializables.values() do
-      i.application_ready_to_work(this)
-    end
-
-    if _is_initializer then
-      match _cluster_initializer
-      | let ci: ClusterInitializer =>
-        ci.topology_ready("initializer")
-        _is_initializer = false
-      else
-        @printf[I32](("Need ClusterInitializer to inform that topology is " +
-          "ready\n").cstring())
-      end
-    end
-
-  fun ref _spin_up_source_listeners() =>
-    if not _topology_initialized then
-      @printf[I32](("ERROR: Tried to spin up source listeners before " +
-        "topology was initialized!\n").cstring())
-    else
-      for builder in sl_builders.values() do
-        let sl = builder()
-        _router_registry.register_source_listener(sl)
-      end
-    end
-
-  be inform_joining_worker(conn: TCPConnection, worker_name: String) =>
-    match _topology
-    | let t: LocalTopology =>
-      _connections.inform_joining_worker(conn, worker_name, t)
-    else
-      Fail()
-    end
-
-  fun _is_ready_for_building(node: DagNode[StepInitializer] val,
-    built_routers: Map[U128, Router]): Bool
-  =>
-    var is_ready = true
-    for out in node.outs() do
-      if not built_routers.contains(out.id) then is_ready = false end
-    end
-    match node.value.pre_state_target_id()
-    | let id: U128 =>
-      if not built_routers.contains(id) then
-        is_ready = false
-      end
-    end
-    is_ready
-
-  fun _get_output_node_id(node: DagNode[StepInitializer] val,
-    default_target_id: U128, default_target_state_step_id: StepId):
-    (U128 | None) ?
-  =>
-    // TODO: Replace this once we move past POC default target strategy
-    if node.id == default_target_id then
-      @printf[I32]("Building default target step\n".cstring())
-      return default_target_state_step_id
-    end
-
-    // Currently there are no splits (II), so we know that a node has
-    // only one output in the graph.
-
-    // Make sure this is not a sink or proxy node.
-    match node.value
-    | let eb: EgressBuilder =>
-      @printf[I32](("Sinks and Proxies have no output nodes in the local " +
-        "graph!\n").cstring())
-      error
-    end
-
-    // ASSUMPTION: Since this is not a sink or proxy, there should be at most
-    // one output.
-    var out_id: (U128 | None) = None
-    for out in node.outs() do
-      out_id = out.id
-    end
-    out_id
-
+///////////////////////
+// AUTOSCALE
+///////////////////////
   be request_new_worker() =>
     try
       (_cluster_manager as ClusterManager).request_new_worker()
@@ -1664,3 +1382,317 @@ actor LocalTopologyInitializer is LayoutInitializer
       @printf[I32](("Attempting to request a new worker but cluster manager is"
         + " None").cstring())
     end
+
+  be worker_join(joining_worker_name: String, joining_worker_count: USize,
+    response_fn: TryJoinResponseFn)
+  =>
+    """
+    Should only be called when a new worker initially contacts the cluster to
+    join. It is called on the initializer, either directly because the new
+    worker joined the intializer, or because the new worker connected to a proxy
+    (non-initializer) and the proxy forwarded the request to the initializer.
+    """
+    match _topology
+    | let t: LocalTopology =>
+      let current_worker_count = t.worker_names.size()
+      let new_t = local_topology_for_joining_worker(t, joining_worker_name)
+      _autoscale.worker_join(joining_worker_name, joining_worker_count, new_t,
+        current_worker_count, response_fn)
+    else
+      Fail()
+    end
+
+  be connect_to_joining_workers(coordinator: String,
+    control_addrs: Map[WorkerName, (String, String)] val,
+    data_addrs: Map[WorkerName, (String, String)] val,
+    new_step_group_routing_ids:
+      Map[WorkerName, Map[RoutingId, RoutingId] val] val)
+  =>
+    let new_workers = recover iso Array[WorkerName] end
+    for w in control_addrs.keys() do new_workers.push(w) end
+    _autoscale.connect_to_joining_workers(consume new_workers,
+      new_step_group_routing_ids, coordinator)
+
+    for w in control_addrs.keys() do
+      try
+        let host = control_addrs(w)?._1
+        let control_addr = control_addrs(w)?
+        let data_addr = data_addrs(w)?
+        let step_group_routing_ids = new_step_group_routing_ids(w)?
+        _add_joining_worker(w, host, control_addr, data_addr,
+          step_group_routing_ids)
+      else
+        Fail()
+      end
+    end
+    _save_local_topology()
+
+  be add_joining_worker(w: WorkerName, joining_host: String,
+    control_addr: (String, String), data_addr: (String, String),
+    step_group_routing_ids: Map[RoutingId, RoutingId] val)
+  =>
+    _add_joining_worker(w, joining_host, control_addr, data_addr,
+      step_group_routing_ids)
+    _save_local_topology()
+
+  fun ref _add_joining_worker(w: WorkerName, joining_host: String,
+    control_addr: (String, String), data_addr: (String, String),
+    step_group_routing_ids: Map[RoutingId, RoutingId] val)
+  =>
+    match _topology
+    | let t: LocalTopology =>
+      if not ArrayHelpers[String].contains[String](t.worker_names, w) then
+        let updated_topology = t.add_new_worker(w, step_group_routing_ids)
+        _topology = updated_topology
+        _save_local_topology()
+        _save_worker_names()
+        _connections.create_control_connection(w, joining_host,
+          control_addr._2)
+        let boundary_id_string = w + "-canonical-boundary"
+        try
+          let new_boundary_id = _string_id_gen(boundary_id_string)?
+          _connections.create_data_connection_to_joining_worker(w,
+            joining_host, data_addr._2, new_boundary_id,
+            step_group_routing_ids, this)
+          _connections.save_connections()
+          @printf[I32]("***New worker %s added to cluster!***\n".cstring(),
+            w.cstring())
+        else
+          Fail()
+        end
+      end
+    else
+      Fail()
+    end
+
+  be initiate_shrink(target_workers: Array[WorkerName] val, shrink_count: U64,
+    response_fn: TryShrinkResponseFn)
+  =>
+    if target_workers.size() > 0 then
+      if _are_valid_shrink_candidates(target_workers) then
+        let remaining_workers = _remove_worker(target_workers)
+        _autoscale.begin_shrink(remaining_workers, target_workers)
+        let reply = ExternalMsgEncoder.shrink_error_response(
+          "Shrinking by " + target_workers.size().string() + " workers!")
+        response_fn(reply)
+      else
+        @printf[I32]("**Invalid shrink targets!**\n".cstring())
+        let error_reply = ExternalMsgEncoder.shrink_error_response(
+          "Invalid shrink targets!")
+
+        response_fn(error_reply)
+      end
+    elseif shrink_count > 0 then
+      let candidates = _get_shrink_candidates(shrink_count.usize())
+      if candidates.size() < shrink_count.usize() then
+        @printf[I32]("**Only %s candidates are eligible for removal\n"
+          .cstring(), candidates.size().string().cstring())
+      else
+        @printf[I32]("**%s candidates are eligible for removal\n"
+          .cstring(), candidates.size().string().cstring())
+      end
+      if candidates.size() > 0 then
+        let remaining_workers = _remove_worker(candidates)
+        _autoscale.begin_shrink(remaining_workers, candidates)
+
+        let reply = ExternalMsgEncoder.shrink_error_response(
+          "Shrinking by " + candidates.size().string() + " workers!")
+        response_fn(reply)
+      else
+        @printf[I32]("**Cannot shrink 0 workers!**\n".cstring())
+        let error_reply = ExternalMsgEncoder.shrink_error_response(
+          "Cannot shrink 0 workers!")
+        response_fn(error_reply)
+      end
+    else
+      @printf[I32]("**Cannot shrink 0 workers!**\n".cstring())
+      let error_reply = ExternalMsgEncoder.shrink_error_response(
+        "Cannot shrink 0 workers!")
+      response_fn(error_reply)
+    end
+
+  be take_over_initiate_shrink(remaining_workers: Array[WorkerName] val,
+    leaving_workers: Array[WorkerName] val)
+  =>
+    _remove_worker(leaving_workers)
+    _autoscale.begin_shrink(remaining_workers, leaving_workers)
+
+  be prepare_shrink(remaining_workers: Array[WorkerName] val,
+    leaving_workers: Array[WorkerName] val)
+  =>
+    _remove_worker(leaving_workers)
+    _router_registry.prepare_shrink(remaining_workers, leaving_workers)
+
+  be remove_worker_connection_info(worker: WorkerName) =>
+    _connections.remove_worker_connection_info(worker)
+    _connections.save_connections()
+
+  fun _are_valid_shrink_candidates(candidates: Array[WorkerName] val): Bool =>
+    match _topology
+    | let t: LocalTopology =>
+      for c in candidates.values() do
+        // A worker name is not a valid candidate if it is non shrinkable
+        // or if it's not in the current cluster.
+        if SetHelpers[String].contains[String](t.non_shrinkable, c) or
+          (not ArrayHelpers[String].contains[String](t.worker_names, c))
+        then
+          return false
+        end
+      end
+      true
+    else
+      Fail()
+      false
+    end
+
+  fun _get_shrink_candidates(count: USize): Array[WorkerName] val =>
+    let candidates = recover trn Array[String] end
+    match _topology
+    | let t: LocalTopology =>
+      for w in t.worker_names.values() do
+        if candidates.size() < count then
+          if not SetHelpers[String].contains[String](t.non_shrinkable, w) then
+            candidates.push(w)
+          end
+        end
+      end
+    else
+      Fail()
+    end
+    consume candidates
+
+  be add_boundary_to_joining_worker(w: WorkerName, boundary: OutgoingBoundary,
+    builder: OutgoingBoundaryBuilder,
+    step_group_routing_ids: Map[RoutingId, RoutingId] val)
+  =>
+    _add_boundary(w, boundary, builder)
+    _router_registry.register_boundaries(_outgoing_boundaries,
+      _outgoing_boundary_builders)
+    _autoscale.joining_worker_initialized(w, step_group_routing_ids)
+
+  fun ref _remove_worker(ws: Array[WorkerName] val): Array[WorkerName] val =>
+    match _topology
+    | let t: LocalTopology =>
+      let new_topology = t.remove_worker(ws)
+      _topology = new_topology
+      _save_local_topology()
+      _save_worker_names()
+      new_topology.worker_names
+    else
+      Fail()
+      recover val Array[WorkerName] end
+    end
+
+  fun ref _add_boundary(target_worker: WorkerName, boundary: OutgoingBoundary,
+    builder: OutgoingBoundaryBuilder)
+  =>
+    // Boundaries
+    let bs = recover trn Map[WorkerName, OutgoingBoundary] end
+    for (w, b) in _outgoing_boundaries.pairs() do
+      bs(w) = b
+    end
+    bs(target_worker) = boundary
+
+    // Boundary builders
+    let bbs = recover trn Map[WorkerName, OutgoingBoundaryBuilder] end
+    for (w, b) in _outgoing_boundary_builders.pairs() do
+      bbs(w) = b
+    end
+    bbs(target_worker) = builder
+
+    _outgoing_boundaries = consume bs
+    _outgoing_boundary_builders = consume bbs
+    _phase.set_initializable(boundary)
+
+  be remove_boundary(leaving_worker: WorkerName) =>
+    // Boundaries
+    let bs = recover trn Map[WorkerName, OutgoingBoundary] end
+    for (w, b) in _outgoing_boundaries.pairs() do
+      if w != leaving_worker then bs(w) = b end
+    end
+
+    // Boundary builders
+    let bbs = recover trn Map[WorkerName, OutgoingBoundaryBuilder] end
+    for (w, b) in _outgoing_boundary_builders.pairs() do
+      if w != leaving_worker then bbs(w) = b end
+    end
+    _outgoing_boundaries = consume bs
+    _outgoing_boundary_builders = consume bbs
+
+  fun ref local_topology_for_joining_worker(t: LocalTopology,
+    joining_worker_name: String): LocalTopology
+  =>
+    t.add_new_worker(joining_worker_name)
+      .new_barrier_source_id(_routing_id_gen())
+
+
+///////////////////////
+// EXTERNAL QUERIES
+///////////////////////
+  be shrinkable_query(conn: TCPConnection) =>
+    let available = recover iso Array[String] end
+    match _topology
+    | let t: LocalTopology =>
+      for w in t.worker_names.values() do
+        if not SetHelpers[String].contains[String](t.non_shrinkable, w) then
+          available.push(w)
+        end
+      end
+      let size = available.size()
+      let query_reply = ExternalMsgEncoder.shrink_query_response(
+        consume available, size.u64())
+      conn.writev(query_reply)
+    else
+      Fail()
+    end
+
+  be partition_query(conn: TCPConnection) =>
+    _router_registry.partition_query(conn)
+
+  be partition_count_query(conn: TCPConnection) =>
+    _router_registry.partition_count_query(conn)
+
+  be cluster_status_query(conn: TCPConnection) =>
+    _phase.cluster_status_query(this, conn)
+
+  fun _cluster_status_query_initialized(conn: TCPConnection) =>
+    match _topology
+    | let t: LocalTopology =>
+      _router_registry.cluster_status_query(t.worker_names, conn)
+    else
+      Fail()
+    end
+
+  fun _cluster_status_query_not_initialized(conn: TCPConnection) =>
+    _router_registry.cluster_status_query_not_initialized(conn)
+
+  be source_ids_query(conn: TCPConnection) =>
+    _router_registry.source_ids_query(conn)
+
+  be state_entity_query(conn: TCPConnection) =>
+    _router_registry.state_entity_query(conn)
+
+  be stateless_partition_query(conn: TCPConnection) =>
+    _router_registry.stateless_partition_query(conn)
+
+  be state_entity_count_query(conn: TCPConnection) =>
+    _router_registry.state_entity_count_query(conn)
+
+  be cluster_state_entity_count_query(conn: TCPConnection) =>
+    match _topology
+    | let t: LocalTopology =>
+      _router_registry.cluster_state_entity_count_query(conn, t.worker_names)
+    else
+      Fail()
+    end
+
+  be stateless_partition_count_query(conn: TCPConnection) =>
+    _router_registry.stateless_partition_count_query(conn)
+
+  be report_status(code: ReportStatusCode) =>
+    match code
+    | BoundaryCountStatus =>
+      @printf[I32]("LocalTopologyInitializer knows about %s boundaries\n"
+        .cstring(), _outgoing_boundaries.size().string().cstring())
+    end
+    _router_registry.report_status(code)

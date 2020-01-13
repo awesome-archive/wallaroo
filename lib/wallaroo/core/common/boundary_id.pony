@@ -18,14 +18,14 @@ Copyright 2017 The Wallaroo Authors.
 
 class BoundaryId is Equatable[BoundaryId]
   let name: String
-  let step_id: StepId
+  let step_id: RoutingId
 
-  new create(n: String, s_id: StepId) =>
+  new create(n: String, s_id: RoutingId) =>
     name = n
     step_id = s_id
 
   fun eq(that: box->BoundaryId): Bool =>
     (name == that.name) and (step_id == that.step_id)
 
-  fun hash(): U64 =>
+  fun hash(): USize =>
     name.hash() xor step_id.hash()

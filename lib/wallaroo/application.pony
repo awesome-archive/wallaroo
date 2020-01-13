@@ -19,9 +19,7 @@ Copyright 2017 The Wallaroo Authors.
 use "collections"
 use "net"
 use "wallaroo/core/common"
-use "wallaroo/ent/network"
-use "wallaroo/ent/recovery"
-use "wallaroo_labs/mort"
+use "wallaroo/core/partitioning"
 use "wallaroo/core/messages"
 use "wallaroo/core/metrics"
 use "wallaroo/core/sink"
@@ -31,269 +29,249 @@ use "wallaroo/core/source/tcp_source"
 use "wallaroo/core/state"
 use "wallaroo/core/routing"
 use "wallaroo/core/topology"
+use "wallaroo/core/windows"
+use "wallaroo/core/network"
+use "wallaroo/core/recovery"
+use "wallaroo_labs/collection_helpers"
+use "wallaroo_labs/dag"
+use "wallaroo_labs/mort"
 
-class Application
-  let _name: String
-  let pipelines: Array[BasicPipeline] = Array[BasicPipeline]
-  // _state_builders maps from state_name to StateSubpartition
-  let _state_builders: Map[String, PartitionBuilder] = _state_builders.create()
-  // TODO: Replace this default strategy with a better one after POC
-  var default_target: (Array[RunnerBuilder] val | None) = None
-  var default_state_name: String = ""
-  var default_target_id: U128 = 0
-  var sink_count: USize = 0
-
-  new create(name': String) =>
-    _name = name'
-
-  fun ref new_pipeline[In: Any val, Out: Any val] (pipeline_name: String,
-    source_config: SourceConfig[In]): PipelineBuilder[In, Out, In]
+primitive Wallaroo
+  fun source[In: Any val](source_name: String,
+    source_config: TypedSourceConfig[In]): Pipeline[In]
   =>
-    // We have removed the ability to turn coalescing off at the command line.
-    let coalescing = true
-    let pipeline_id = pipelines.size()
-    let pipeline = Pipeline[In, Out](_name, pipeline_id, pipeline_name,
-      source_config, coalescing)
-    PipelineBuilder[In, Out, In](this, pipeline)
+    Pipeline[In].from_source(source_name, source_config)
 
-  // TODO: Replace this with a better approach.  This is a shortcut to get
-  // the POC working and handle unknown bucket in the partition.
-  fun ref partition_default_target[In: Any val, Out: Any val,
-    S: State ref](
-    pipeline_name: String,
-    default_name: String,
-    s_comp: StateComputation[In, Out, S] val,
-    s_initializer: StateBuilder[S]): Application
+  fun build_application(env: Env, app_name: String,
+    pipeline: BasicPipeline val)
   =>
-    default_state_name = default_name
-
-    let builders = recover trn Array[RunnerBuilder] end
-
-    let pre_state_builder = PreStateRunnerBuilder[In, Out, In, U8, S](
-      s_comp, default_name, SingleStepPartitionFunction[In],
-      TypedRouteBuilder[StateProcessor[S]],
-      TypedRouteBuilder[Out], TypedRouteBuilder[In])
-    builders.push(pre_state_builder)
-
-    let state_builder' = StateRunnerBuilder[S](s_initializer, default_name,
-      s_comp.state_change_builders(), TypedRouteBuilder[Out])
-    builders.push(state_builder')
-
-    default_target = consume builders
-    default_target_id = pre_state_builder.id()
-
-    this
-
-  fun ref add_pipeline(p: BasicPipeline) =>
-    pipelines.push(p)
-
-  fun ref add_state_builder(state_name: String,
-    state_partition: PartitionBuilder)
-  =>
-    _state_builders(state_name) = state_partition
-
-  fun ref increment_sink_count() =>
-    sink_count = sink_count + 1
-
-  fun state_builder(state_name: String): PartitionBuilder ? =>
-    _state_builders(state_name)
-
-  fun state_builders(): Map[String, PartitionBuilder] val =>
-    let builders = recover trn Map[String, PartitionBuilder] end
-    for (k, v) in _state_builders.pairs() do
-      builders(k) = v
+    if pipeline.is_finished() then
+      Startup(env, app_name, pipeline)
+    else
+      FatalUserError("A pipeline must terminate in a sink!")
     end
-    consume builders
 
-  fun name(): String => _name
+  fun range_windows(range: U64): RangeWindowsBuilder =>
+    RangeWindowsBuilder(where range = range)
+
+  fun ephemeral_windows(trigger_range: U64, post_trigger_range: U64):
+    EphemeralWindowsBuilder
+  =>
+    EphemeralWindowsBuilder(trigger_range, post_trigger_range)
+
+  fun count_windows(count: USize): CountWindowsBuilder =>
+    CountWindowsBuilder(where count = count)
 
 trait BasicPipeline
-  fun name(): String
-  fun source_id(): USize
-  fun source_builder(): SourceBuilderBuilder ?
-  fun source_route_builder(): RouteBuilder
-  fun source_listener_builder_builder(): SourceListenerBuilderBuilder
-  fun sink_builder(): (SinkBuilder | None)
-  // TODO: Change this when we need more sinks per pipeline
-  // ASSUMPTION: There is at most one sink per pipeline
-  fun sink_id(): (U128 | None)
-  // The index into the list of provided sink addresses
-  fun is_coalesced(): Bool
-  fun apply(i: USize): RunnerBuilder ?
+  fun graph(): this->Dag[LogicalStage]
+  fun is_finished(): Bool
   fun size(): USize
+  fun worker_source_configs(): this->Map[SourceName, WorkerSourceConfig]
 
-class Pipeline[In: Any val, Out: Any val] is BasicPipeline
-  let _pipeline_id: USize
-  let _name: String
-  let _app_name: String
-  let _runner_builders: Array[RunnerBuilder]
-  var _source_builder: (SourceBuilderBuilder | None) = None
-  let _source_route_builder: RouteBuilder
-  let _source_listener_builder_builder: SourceListenerBuilderBuilder
-  var _sink_builder: (SinkBuilder | None) = None
+type LogicalStage is (RunnerBuilder | SinkBuilder | Array[SinkBuilder] val |
+  SourceConfigWrapper | RandomPartitionerBuilder | KeyPartitionerBuilder)
 
-  var _sink_id: (U128 | None) = None
-  let _is_coalesced: Bool
+class Pipeline[Out: Any val] is BasicPipeline
+  let _stages: Dag[LogicalStage]
+  let _dag_sink_ids: Array[RoutingId]
+  var _worker_source_configs: Map[SourceName, WorkerSourceConfig] =
+    _worker_source_configs.create()
+  var _finished: Bool
 
-  new create(app_name: String, p_id: USize, n: String,
-    sc: SourceConfig[In], coalescing: Bool)
+  var _last_is_shuffle: Bool
+  var _last_is_key_by: Bool
+  // A local_key_by call means we keep using worker-local routing until we
+  // come to collect() or key_by()
+  var _local_routing: Bool
+
+  new from_source(n: String, source_config: TypedSourceConfig[Out]) =>
+    _stages = Dag[LogicalStage]
+    _dag_sink_ids = Array[RoutingId]
+    _finished = false
+    _last_is_shuffle = false
+    _last_is_key_by = false
+    _local_routing = false
+    let sc_wrapper = SourceConfigWrapper(n, source_config)
+    let source_id' = _stages.add_node(sc_wrapper)
+    _dag_sink_ids.push(source_id')
+    _worker_source_configs.update(sc_wrapper.name(),
+      source_config.worker_source_config())
+
+  new create(stages: Dag[LogicalStage] = Dag[LogicalStage],
+    dag_sink_ids: Array[RoutingId] = Array[RoutingId],
+    worker_source_configs': Map[SourceName, WorkerSourceConfig],
+    local_routing: Bool,
+    finished: Bool = false,
+    last_is_shuffle: Bool = false,
+    last_is_key_by: Bool = false)
   =>
-    _pipeline_id = p_id
-    _runner_builders = Array[RunnerBuilder]
-    _name = n
-    _app_name = app_name
-    _source_route_builder = TypedRouteBuilder[In]
-    _is_coalesced = coalescing
-    _source_listener_builder_builder = sc.source_listener_builder_builder()
-    _source_builder = sc.source_builder(_app_name, _name)
+    _stages = stages
+    _dag_sink_ids = dag_sink_ids
+    _worker_source_configs = worker_source_configs'
+    _finished = finished
+    _last_is_shuffle = last_is_shuffle
+    _last_is_key_by = last_is_key_by
+    _local_routing = local_routing
 
-  fun ref add_runner_builder(p: RunnerBuilder) =>
-    _runner_builders.push(p)
+  fun is_finished(): Bool => _finished
 
-  fun apply(i: USize): RunnerBuilder ? => _runner_builders(i)
-
-  fun ref update_sink(sink_builder': SinkBuilder) =>
-    _sink_builder = sink_builder'
-
-  fun source_id(): USize => _pipeline_id
-
-  fun source_builder(): SourceBuilderBuilder ? =>
-    _source_builder as SourceBuilderBuilder
-
-  fun source_route_builder(): RouteBuilder => _source_route_builder
-
-  fun source_listener_builder_builder(): SourceListenerBuilderBuilder =>
-    _source_listener_builder_builder
-
-  fun sink_builder(): (SinkBuilder | None) => _sink_builder
-
-  // TODO: Change this when we need more sinks per pipeline
-  // ASSUMPTION: There is at most one sink per pipeline
-  fun sink_id(): (U128 | None) => _sink_id
-
-  fun ref update_sink_id() =>
-    _sink_id = StepIdGenerator()
-
-  fun is_coalesced(): Bool => _is_coalesced
-
-  fun size(): USize => _runner_builders.size()
-
-  fun name(): String => _name
-
-class PipelineBuilder[In: Any val, Out: Any val, Last: Any val]
-  let _a: Application
-  let _p: Pipeline[In, Out]
-
-  new create(a: Application, p: Pipeline[In, Out]) =>
-    _a = a
-    _p = p
-
-  fun ref to[Next: Any val](
-    comp_builder: ComputationBuilder[Last, Next],
-    id: U128 = 0): PipelineBuilder[In, Out, Next]
+  fun ref merge[MergeOut: Any val](pipeline: Pipeline[MergeOut]):
+    Pipeline[(Out | MergeOut)]
   =>
-    let next_builder = ComputationRunnerBuilder[Last, Next](comp_builder,
-      TypedRouteBuilder[Next])
-    _p.add_runner_builder(next_builder)
-    PipelineBuilder[In, Out, Next](_a, _p)
-
-  fun ref to_parallel[Next: Any val](
-    comp_builder: ComputationBuilder[Last, Next],
-    id: U128 = 0): PipelineBuilder[In, Out, Next]
-  =>
-    let next_builder = ComputationRunnerBuilder[Last, Next](
-      comp_builder, TypedRouteBuilder[Next] where parallelized' = true)
-    _p.add_runner_builder(next_builder)
-    PipelineBuilder[In, Out, Next](_a, _p)
-
-  fun ref to_stateful[Next: Any val, S: State ref](
-    s_comp: StateComputation[Last, Next, S] val,
-    s_initializer: StateBuilder[S],
-    state_name: String): PipelineBuilder[In, Out, Next]
-  =>
-    // TODO: This is a shortcut. Non-partitioned state is being treated as a
-    // special case of partitioned state with one partition. This works but is
-    // a bit confusing when reading the code.
-    let step_id_gen = StepIdGenerator
-    let single_step_partition = Partition[Last, U8](
-      SingleStepPartitionFunction[Last], recover [0] end)
-    let step_id_map = recover trn Map[U8, StepId] end
-
-    step_id_map(0) = step_id_gen()
-
-
-    let next_builder = PreStateRunnerBuilder[Last, Next, Last, U8, S](
-      s_comp, state_name, SingleStepPartitionFunction[Last],
-      TypedRouteBuilder[StateProcessor[S]],
-      TypedRouteBuilder[Next])
-
-    _p.add_runner_builder(next_builder)
-
-    let state_builder = PartitionedStateRunnerBuilder[Last, S, U8](_p.name(),
-      state_name, consume step_id_map, single_step_partition,
-      StateRunnerBuilder[S](s_initializer, state_name,
-        s_comp.state_change_builders()),
-      TypedRouteBuilder[StateProcessor[S]],
-      TypedRouteBuilder[Next])
-
-    _a.add_state_builder(state_name, state_builder)
-
-    PipelineBuilder[In, Out, Next](_a, _p)
-
-  fun ref to_state_partition[PIn: Any val,
-    Key: (Hashable val & Equatable[Key]), Next: Any val = PIn,
-    S: State ref](
-      s_comp: StateComputation[Last, Next, S] val,
-      s_initializer: StateBuilder[S],
-      state_name: String,
-      partition: Partition[PIn, Key],
-      multi_worker: Bool = false,
-      default_state_name: String = ""
-    ): PipelineBuilder[In, Out, Next]
-  =>
-    let step_id_gen = StepIdGenerator
-    let step_id_map = recover trn Map[Key, U128] end
-
-    match partition.keys()
-    | let wks: Array[WeightedKey[Key]] val =>
-      for wkey in wks.values() do
-        step_id_map(wkey._1) = step_id_gen()
+    if _finished then
+      _try_merge_with_finished_pipeline()
+    elseif (_last_is_shuffle and not pipeline._last_is_shuffle) or
+      (not _last_is_shuffle and pipeline._last_is_shuffle)
+    then
+      _only_one_is_shuffle()
+    elseif (_last_is_key_by and not pipeline._last_is_key_by) or
+      (not _last_is_key_by and pipeline._last_is_key_by)
+    then
+      _only_one_is_key_by()
+    else
+      // Successful merge
+      try
+        _stages.merge(pipeline._stages)?
+        _worker_source_configs.concat(pipeline.worker_source_configs().pairs())
+      else
+        // We should have ruled this out through the if branches
+        Unreachable()
       end
-    | let ks: Array[Key] val =>
-      for key in ks.values() do
-        step_id_map(key) = step_id_gen()
+      _dag_sink_ids.append(pipeline._dag_sink_ids)
+      return Pipeline[(Out | MergeOut)](_stages, _dag_sink_ids,
+        _worker_source_configs where local_routing = _local_routing,
+        last_is_shuffle = _last_is_shuffle,
+        last_is_key_by = _last_is_key_by)
+    end
+    Pipeline[(Out | MergeOut)](_stages, _dag_sink_ids, _worker_source_configs
+      where local_routing = _local_routing)
+
+  fun ref to[Next: Any val](comp: Computation[Out, Next],
+    parallelism: USize = 10): Pipeline[Next]
+  =>
+    let node_id = RoutingIdGenerator()
+    if not _finished then
+      let runner_builder = comp.runner_builder(node_id, parallelism,
+        _local_routing)
+      _stages.add_node(runner_builder, node_id)
+      try
+        for sink_id in _dag_sink_ids.values() do
+          _stages.add_edge(sink_id, node_id)?
+        end
+      else
+        Fail()
       end
+      Pipeline[Next](_stages, [node_id], _worker_source_configs
+        where local_routing = _local_routing)
+    else
+      _try_add_to_finished_pipeline()
+      Pipeline[Next](_stages, _dag_sink_ids, _worker_source_configs
+        where local_routing = _local_routing)
     end
 
-    let next_builder = PreStateRunnerBuilder[Last, Next, PIn, Key, S](
-      s_comp, state_name, partition.function(),
-      TypedRouteBuilder[StateProcessor[S]],
-      TypedRouteBuilder[Next] where multi_worker = multi_worker,
-      default_state_name' = default_state_name)
+  fun ref to_sink(sink_information: SinkConfig[Out],
+    parallelism: USize = 1): Pipeline[Out]
+  =>
+    if not _finished then
+      let sink_builder = sink_information(parallelism)
+      let node_id = _stages.add_node(sink_builder)
+      try
+        for dag_sink_id in _dag_sink_ids.values() do
+          _stages.add_edge(dag_sink_id, node_id)?
+        end
+      else
+        Fail()
+      end
+      Pipeline[Out](_stages, [node_id], _worker_source_configs
+        where local_routing = _local_routing, finished = true)
+    else
+      _try_add_to_finished_pipeline()
+      Pipeline[Out](_stages, _dag_sink_ids, _worker_source_configs
+        where local_routing = _local_routing)
+    end
 
-    _p.add_runner_builder(next_builder)
+  fun ref to_sinks(sink_configs: Array[SinkConfig[Out]] box,
+    parallelism: USize = 1): Pipeline[Out]
+  =>
+    if not _finished then
+      if sink_configs.size() == 0 then
+        FatalUserError("You must specify at least one sink when using " +
+          "to_sinks()")
+      end
+      let sink_bs = recover iso Array[SinkBuilder] end
+      for config in sink_configs.values() do
+        sink_bs.push(config(parallelism))
+      end
+      let node_id = _stages.add_node(consume sink_bs)
+      try
+        for dag_sink_id in _dag_sink_ids.values() do
+          _stages.add_edge(dag_sink_id, node_id)?
+        end
+      else
+        Fail()
+      end
+      Pipeline[Out](_stages, [node_id], _worker_source_configs
+        where local_routing = _local_routing, finished = true)
+    else
+      _try_add_to_finished_pipeline()
+      Pipeline[Out](_stages, _dag_sink_ids, _worker_source_configs
+        where local_routing = _local_routing)
+    end
 
-    let state_builder = PartitionedStateRunnerBuilder[PIn, S,
-      Key](_p.name(), state_name, consume step_id_map, partition,
-        StateRunnerBuilder[S](s_initializer, state_name,
-          s_comp.state_change_builders()),
-        TypedRouteBuilder[StateProcessor[S]],
-        TypedRouteBuilder[Next]
-        where multi_worker = multi_worker, default_state_name' =
-        default_state_name)
+  fun ref key_by(pf: KeyExtractor[Out], local_routing: Bool = false):
+    Pipeline[Out]
+  =>
+    if not _finished then
+      let node_id = _stages.add_node(TypedKeyPartitionerBuilder[Out](pf))
+      try
+        for sink_id in _dag_sink_ids.values() do
+          _stages.add_edge(sink_id, node_id)?
+        end
+      else
+        Fail()
+      end
+      Pipeline[Out](_stages, [node_id], _worker_source_configs
+        where local_routing = local_routing, last_is_key_by = true)
+    else
+      _try_add_to_finished_pipeline()
+      Pipeline[Out](_stages, _dag_sink_ids, _worker_source_configs
+        where local_routing = local_routing)
+    end
 
-    _a.add_state_builder(state_name, state_builder)
+  // local_key_by indicates that all messages will be routed to steps on the
+  // same worker. This will apply to all stages following a local_key_by that
+  // come before a subsequent key_by() or collect(). Worker local routing
+  // allows applications to reduce network traffic by performing local
+  // pre-aggregations before sending the results of these pre-aggregations
+  // downstream to a final aggregation.
+  fun ref local_key_by(pf: KeyExtractor[Out]): Pipeline[Out] =>
+    key_by(pf where local_routing = true)
 
-    PipelineBuilder[In, Out, Next](_a, _p)
+  fun ref collect(local_routing: Bool = false): Pipeline[Out] =>
+    let collect_key = CollectKeyGenerator()
+    key_by(CollectKeyExtractor[Out](collect_key)
+      where local_routing = local_routing)
 
-  fun ref done(): Application ? =>
-    _a.add_pipeline(_p as BasicPipeline)
-    _a
+  fun ref local_collect(): Pipeline[Out] =>
+    collect(where local_routing = true)
 
-  fun ref to_sink(sink_information: SinkConfig[Out]): Application ? =>
-    let sink_builder = sink_information()
-    _a.increment_sink_count()
-    _p.update_sink(sink_builder)
-    _p.update_sink_id()
-    _a.add_pipeline(_p as BasicPipeline)
-    _a
+  fun graph(): this->Dag[LogicalStage] => _stages
+
+  fun worker_source_configs(): this->Map[SourceName, WorkerSourceConfig] =>
+    _worker_source_configs
+
+  fun size(): USize => _stages.size()
+
+  fun _try_add_to_finished_pipeline() =>
+    FatalUserError("You can't add further stages after a sink!")
+
+  fun _try_merge_with_finished_pipeline() =>
+    FatalUserError("You can't merge with a terminated pipeline!")
+
+  fun _only_one_is_shuffle() =>
+    FatalUserError(
+      "A pipeline ending with shuffle can only be merged with another!")
+
+  fun _only_one_is_key_by() =>
+    FatalUserError(
+      "A pipeline ending with key_by can only be merged with another!")

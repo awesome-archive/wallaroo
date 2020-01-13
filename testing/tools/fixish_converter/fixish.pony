@@ -1,12 +1,18 @@
 /*
 
-Copyright 2017 The Wallaroo Authors.
+Copyright 2018 The Wallaroo Authors.
 
-Licensed as a Wallaroo Enterprise file under the Wallaroo Community
-License (the "License"); you may not use this file except in compliance with
-the License. You may obtain a copy of the License at
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
 
-     https://github.com/wallaroolabs/wallaroo/blob/master/LICENSE
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ implied. See the License for the specific language governing
+ permissions and limitations under the License.
 
 */
 
@@ -54,8 +60,8 @@ actor Main
     try
       let auth = env.root as AmbientAuth
 
-      let input_file = File(FilePath(auth, input_file_path))
-      let output_file = File(FilePath(auth, output_file_path))
+      let input_file = File(FilePath(auth, input_file_path)?)
+      let output_file = File(FilePath(auth, output_file_path)?)
       output_file.set_length(0)
 
       if readable then
@@ -64,9 +70,9 @@ actor Main
         rb.append(input)
         var left = input.size()
         while left > 0 do
-          let size = rb.u32_be().usize()
-          let next = rb.block(size)
-          match FixishMsgDecoder(consume next)
+          let size = rb.u32_be()?.usize()
+          let next = rb.block(size)?
+          match FixishMsgDecoder(consume next)?
           | let m: FixOrderMessage val =>
             output_file.print(m.string())
           | let m: FixNbboMessage val =>
@@ -78,7 +84,7 @@ actor Main
         let wb = Writer
         var p = true
         for line in input_file.lines() do
-          match FixParser(line)
+          match FixParser(consume line)
           | let m: FixOrderMessage val =>
             try
               if m.order_id().size() != 6 then error end

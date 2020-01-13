@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+
+import argparse
+from collections import namedtuple
+import datetime
+import logging
+import os
+import random
+import shutil
+import struct
+import time
+
+from integration.cluster import runner_data_format
+from integration.end_points import (ALOSequenceGenerator,
+                                    files_generator,
+                                    iter_generator,
+                                    sequence_generator)
+from integration.errors import RunnerHasntStartedError
+from integration.external import save_logs_to_file
+from integration.integration import pipeline_test
+from integration.logger import (add_in_memory_log_stream,
+                                get_log_level,
+                                INFO2,
+                                set_logging)
+
+
+"""
+Run an integration test as a CLI
+"""
+
+
+class CSVGenAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        """
+        Permit two cases: 2, and 3 values.
+        2 values: Take {0} as iter, use source {1}, and header format '>I'
+        3 values: Take {0} as iter, use source {1}, and header format {2}
+        """
+        if len(values) == 2:
+            gen = iter_generator(values[0].split(','))
+            source = values[1]
+        elif len(values) == 3:
+            gen = iter_generator(values[0].split(','),
+                                 header_fmt=values[2])
+            source = values[1]
+        else:
+            msg = ('Argument "{f}" requires 2, or 3 arguments specifying '
+                   'comma-separated-list, source-name [, header format].\n'
+                   "When unspecified, header format is "
+                   "'>I'".format(f=self.dest))
+            raise argparse.ArgumentTypeError(msg)
+
+        try:
+            dest = getattr(namespace, self.dest)
+            if not dest:
+                dest= []
+                setattr(namespace, self.dest, dest)
+        except AttributeError:
+            dest = []
+            setattr(namespace, self.dest, dest)
+        dest.append((gen, source))
+
+
+class ALOSeqGenAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        # (range, source_name, key)
+        key = values[0]
+        start, stop = SeqGenAction.parse_range(values[1])
+        source = values[2]
+        gen = ALOSequenceGenerator(key, stop, start)
+        try:
+            dest = getattr(namespace, self.dest)
+            if not dest:
+                dest= []
+                setattr(namespace, self.dest, dest)
+        except AttributeError:
+            dest = []
+            setattr(namespace, self.dest, dest)
+        dest.append((gen, source))
+
+
+class SeqGenAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        """
+        Permit four cases: 2, 3, and 4 values
+        2 values: range = {0}, source = {1}, header format = '>I'
+        3 values: range = {0}, source = {1}, header format = {2}
+        4 values: range = {0}, source = {1}, header format = {2}, partition = {3}
+
+        range is a range notation, using () for exclusive, [] for inclusive,
+        and two integers separated by a comma to denote the start and stop.
+        E.g. (0, 1000] will produce 1, 2, 3, ..., 1000. And [0, 1000) will
+        produce 0, 1, 2, ..., 999.
+        """
+        if len(values) == 2:
+            start, stop = self.parse_range(values[0])
+            source = values[1]
+            gen = sequence_generator(stop, start)
+        elif len(values) == 3:
+            start, stop = self.parse_range(values[0])
+            source = values[1]
+            header_fmt = values[2]
+            gen = sequence_generator(stop, start, header_fmt)
+        elif len(values) == 4:
+            start, stop = self.parse_range(values[0])
+            source = values[1]
+            header_fmt = values[2]
+            partition = values[3]
+            gen = sequence_generator(stop, start, header_fmt, partition)
+        else:
+            msg = ('Argument "{f}" requires 2, 3, or 4 arguments specifying '
+                   '(start, stop], source-index [, header format '
+                   '[, partition]].\n'
+                   "When unspecified, header format is "
+                   "'>I', and partition is empty".format(f=self.dest))
+            raise argparse.ArgumentTypeError(msg)
+
+        try:
+            dest = getattr(namespace, self.dest)
+            if not dest:
+                dest= []
+                setattr(namespace, self.dest, dest)
+        except AttributeError:
+            dest = []
+            setattr(namespace, self.dest, dest)
+        dest.append((gen, source))
+
+    @staticmethod
+    def parse_range(range_str):
+        start, stop = range_str.lstrip().rstrip().split(',')
+        start_type, start_val = start[:1], start[1:]
+        if not start_val:
+            start_val = 0
+        if start_type == '[':
+            start = int(start_val) - 1
+        else:
+            start = int(start_val)
+
+        stop_val, stop_type = stop[:-1], stop[-1:]
+        if not stop_val:
+            stop_val = 1000
+        if stop_type == ']':
+            stop = int(stop_val)
+        elif stop_type == ')':
+            stop = int(stop_val) -1
+        return start, stop
+
+
+class NewlineGenAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        """
+        Permit three cases: 2, and 3 values
+        2 values: paths = {0}, source = {1}, header format = '>I'
+        3 values: paths = {0}, source = {1}, header format = {2}
+        """
+        paths = values[0].split(',')
+        if len(values) == 2:
+            source = values[1]
+            gen = files_generator(paths, mode='newlines')
+        elif len(values) == 3:
+            source = values[1]
+            gen = files_generator(paths, mode='newlines',
+                                  header_fmt = values[2])
+        else:
+            msg = ('Argument "{f}" requires 2, or 3 arguments specifying '
+                   'paths, source-name [, header format].\n'
+                   "When unspecified, header format is "
+                   "'>I'".format(f=self.dest))
+            raise argparse.ArgumentTypeError(msg)
+
+        try:
+            dest = getattr(namespace, self.dest)
+            if not dest:
+                dest= []
+                setattr(namespace, self.dest, dest)
+        except AttributeError:
+            dest = []
+            setattr(namespace, self.dest, dest)
+        dest.append((gen, source))
+
+
+class FramedGenAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        """
+        Permit three cases: 2, and 3 values
+        2 values: paths = {0}, source = {1}, header format = '>I'
+        3 values: paths = {0}, source = {1}, header format = {2}
+        """
+        paths = values[0].split(',')
+        if len(values) == 2:
+            source = values[1]
+            gen = files_generator(paths, mode='framed')
+        elif len(values) == 3:
+            source = values[1]
+            gen = files_generator(paths, mode='framed',
+                                  header_fmt = values[2])
+        else:
+            msg = ('Argument "{f}" requires 2, or 3 arguments specifying '
+                   'paths, source-name [, header format].\n'
+                   "When unspecified, header format is "
+                   "'>I'".format(f=self.dest))
+            raise argparse.ArgumentTypeError(msg)
+
+        try:
+            dest = getattr(namespace, self.dest)
+            if not dest:
+                dest= []
+                setattr(namespace, self.dest, dest)
+        except AttributeError:
+            dest = []
+            setattr(namespace, self.dest, dest)
+        dest.append((gen, source))
+
+
+class CSVStringAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        """
+        Split the string and store the list as expected-csv
+        Permit 2 cases;
+        1 value: assume type is string
+        2 values: csv: {0}, type name: {1}
+
+        Types allowed are:
+        'string', 'int', 'float'
+        """
+        if not isinstance(values, list):
+            values = [values]
+        if len(values) == 1:
+            setattr(namespace, self.dest, map(lambda s: s.encode(),
+                                              values[0].split(',')))
+        elif len(values) == 2:
+            if values[1] == 'string':
+                setattr(namespace, self.dest, map(lambda s: s.encode(),
+                                                  values[0].split(',')))
+            elif values[1] == 'int':
+                setattr(namespace, self.dest, map(int, values[0].split(',')))
+            elif values[1] == 'float':
+                setattr(namespace, self.dest, map(float, values[0].split(',')))
+            else:
+                msg = ('Argument "{f}" requires 1 or 2 arguments specifying '
+                       'a comma-delimited list of values [, type name (one of'
+                       ' "int", "float", "string").')
+                raise argparse.ArgumentTypeError(msg)
+
+        else:
+            msg = ('Argument "{f}" requires 1 or 2 arguments specifying '
+                   'a comma-delimited list of values [, type name (one of'
+                   ' "int", "float", "string").')
+            raise argparse.ArgumentTypeError(msg)
+
+
+SpikeConfig = namedtuple('SpikeConfig', ['probability', 'margin', 'seed'])
+
+
+class SpikeAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        """
+        Parameters (values): (index, probability, margin, seed)
+        defaults: index = 0, probability = 0.001, margin = 100, seed = None
+        """
+        if len(values) == 1:
+            index = int(values[0])  # Parse index
+            prob = 0.001
+            margin = 100
+            seed = None
+        elif len(values) == 2:
+            index = int(values[0])  # Parse index
+            prob = float(values[1]) # Parse probability
+            margin = 100
+            seed = None
+        elif len(values) == 3:
+            index = int(values[0])  # Parse index
+            prob = float(values[1]) # Parse probability
+            margin = int(values[2]) # Parse margin
+            seed = None
+        elif len(values) == 4:
+            index = int(values[0])  # Parse index
+            prob = float(values[1]) # Parse probability
+            margin = int(values[2]) # Parse margin
+            seed = int(values[3])   # Parse seed
+        else:
+            msg = ('Argument "{f}" requires 1, 2, 3 or 4 arguments specifying '
+                   'index [, probability [, margin [, seed]]].'
+                   .format(f=self.dest))
+            raise argparse.ArgumentTypeError(msg)
+
+        try:
+            dest = getattr(namespace, self.dest)
+            if not dest:
+                dest= {}
+                setattr(namespace, self.dest, dest)
+        except AttributeError:
+            dest = {}
+            setattr(namespace, self.dest, dest)
+        dest[index] = SpikeConfig(prob, margin, seed)
+
+
+class SinkAwaitAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        """
+        Parameters (values): [value, header]
+        Encode header with struct.pack using len(value)
+        """
+        if len(values) == 1:
+            values.append('>I')
+        elif len(values) != 2:
+            msg = ('Argument "{f}" requires 1 or 2 arguments specifying '
+                   'value [header]'.format(f=self.dest))
+            raise argparse.ArgumentTypeError(msg)
+        dest = getattr(namespace, self.dest)
+        if not dest:
+            dest = []
+            setattr(namespace, self.dest, dest)
+        if values[1]:
+            dest.append(struct.pack(values[1], len(values[0])) + values[0].encode())
+        else:
+            dest.append(values[0])
+
+
+class SinkAwaitKeysAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        """
+        Parameters values: [key, value]
+        """
+        if len(values) != 2:
+            msg = ('Argument "{f}" requires 2 arguments specifying '
+                   'key value '.format(f=self.dest))
+            raise argparse.ArgumentTypeError(msg)
+        key, value = values
+        dest = getattr(namespace, self.dest)
+        if not dest:
+            dest = []
+            setattr(namespace, self.dest, dest)
+        dest.append((key, value))
+
+
+class SetLogFile(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        """Set the log file"""
+        fh = logging.FileHandler(value, 'w')
+        fh.setFormatter(logging.root.formatter)
+        logging.root.addHandler(fh)
+
+
+class NargsHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def _format_args(self, action, default_metavar):
+        if action.nargs == '+':
+            if isinstance(action.metavar, (list, tuple)):
+                nargs = len(action.metavar)
+                acc = ['%s' % action.metavar[0]]
+                for mv in action.metavar[1:]:
+                    acc.append('[ %s' % mv)
+                acc.append(']'*(nargs-1))
+                return ''.join(acc)
+        return super(NargsHelpFormatter, self)._format_args(action,
+                                                            default_metavar)
+
+
+def CLI():
+    parser = argparse.ArgumentParser(prog='Integration Test',
+                                     formatter_class=NargsHelpFormatter)
+
+    # Input generators: framed file, newlines file, sequence, and iter
+    gens = parser.add_argument_group('Senders', '''
+        Send data using one of the various data generators.
+        Optionally specify application source index, and header format to be used
+        with the sender.
+
+        - source index is a 0-indexed integer corresponding to the order in which
+          the source is declared in the application topology. Default: 0
+        - header format is a formatting string to be used by python's struct.pack
+          (https://docs.python.org/2/library/struct.html#format-characters).
+          Default: '>I'
+        ''')
+    gens.add_argument('--framed-file-sender', dest='sources', default=[],
+                      action=FramedGenAction, nargs='+',
+                      metavar=('filepaths', 'source_name', 'header_format'),
+                      help=("Send values from a comma-separated list of "
+                           "files."))
+    gens.add_argument('--newline-file-sender', dest='sources', default=[],
+                      action=NewlineGenAction, nargs='+',
+                      metavar=('filepaths', 'source_name', 'header_format'),
+                      help=("Send values form a comma-separated list of "
+                            "files that use newlines to separate records."))
+    gens.add_argument('--sequence-sender', dest='sources', default=[],
+                      action=SeqGenAction, nargs='+',
+                      metavar=('range', 'source_name', 'header_format',
+                               'partition'),
+                      help=("Send values from the set of integers "
+                            "(start,stop]"))
+    gens.add_argument('--csv-sender', dest='sources', default=[],
+                      action=CSVGenAction, nargs='+',
+                      metavar=('item1,item2,...', 'source_name', 'header_format'),
+                      help="Send values from a comma delimited string")
+    gens.add_argument('--alo-sequence-sender', dest='sources',
+                      action=ALOSeqGenAction, nargs=3,
+                      metavar=('range', 'source_name', 'key'),
+                      help=("Send values from the set of integers up to "
+                            "STOP, using an at-least-once connector."))
+
+    # Network parameters
+    net1 = parser.add_argument_group('Network')
+    net1.add_argument('--host', help=("The host address to use in "
+                                           "networked components."),
+                           default='127.0.0.1')
+    net1.add_argument('--spike', nargs='+', action=SpikeAction, default=[],
+                      metavar=('index', 'probability', 'margin', 'seed'),
+                      help=("Spike the connection on the specified worker"))
+
+    # Expected data for validation
+    exp_group = parser.add_mutually_exclusive_group()
+    exp_group.add_argument('--expected-file', help=("The path to a file "
+                           "containing binary data to compare against the "
+                           "output."))
+    exp_group.add_argument('--expected-csv', dest='expected_val',
+                           nargs='+',
+                           help=("A comma delimited list of"
+                           " of values to compare against the output data."),
+                           action=CSVStringAction)
+    exp_group.add_argument('--expected-string', dest='expected_val',
+                           help=("A string to compare "
+                           "against the output data."))
+
+    # Validation action: execute a command, or perform a direct comparison
+    val_group = parser.add_mutually_exclusive_group(required=True)
+    val_group.add_argument('--validation-cmd', help=("The command to execute "
+                           "with the output data file as its first argument "
+                           "and optionally the expected data file as its "
+                           "second."))
+    val_group.add_argument('--validation-cmp', action='store_true',
+                           help=("Perform a direct "
+                           "comparison between the output data and expected "
+                           "data provided by '--expected-csv' or "
+                           "--expected-string'"))
+
+    parser.add_argument('--output', type=str, help=("Filepath(s) to save sink "
+                        "output to for external validation. If used with "
+                        "'--validation-cmd', this filepath will be appended "
+                        "to the end of the command string."))
+    # Detail for the specific run
+    parser.add_argument('--workers', type=int, default=1,
+                        help="Number of workers to use in the test.")
+    parser.add_argument('--sinks', type=int, default=1,
+                        help="Number of sinks the application outputs to.")
+    parser.add_argument('--sink-mode', default='framed',
+                        choices=['newlines', 'framed'])
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help=("The batch size to use in the senders. "
+                              "The same batch size is used in all senders."))
+    parser.add_argument('--sender-interval', type=float, default=0.001,
+                        help=("The interval between batch sends in the sender"))
+    parser.add_argument('--resilience-dir', type=str, default=None,
+                        help=("The path of the resilience data files. "
+                              "(default=random directory in /tmp created by "
+                              "tempfile.mkdtemp()."))
+
+    # When to stop the run and begin validation
+    stopper = parser.add_mutually_exclusive_group()
+    expect = stopper.add_argument_group('Sink Expect')
+    expect.add_argument('--sink-expect', type=int, action='append',
+                        help=("How many messages to expect at each sink."))
+    stopper.add_argument('--sink-expect-allow-more', action='store_true',
+                         help=("Allow sink to receive more than the expected"
+                               " number of values"))
+    stopper.add_argument('--sink-await', nargs='+', action=SinkAwaitAction,
+                         metavar=('value', 'header'),
+                         help=("Stop after receiving all await values in the"
+                               "sink"))
+    stopper.add_argument('--sink-await-keys', action=SinkAwaitKeysAction,
+                         nargs='+', metavar=('key', 'value'),
+                         help=("Key and Value to match on, as strings"))
+    expect.add_argument('--sink-stop-timeout', type=float, default=90,
+                        help=("Timeout in seconds before raising a "
+                              "TimeoutError"))
+    stopper.add_argument('--delay', type=float, default=None,
+                         help=("The delay between end of senders and output "
+                               "validation. Inferred from metrics data if not "
+                               "set"))
+
+    parser.add_argument('--command', type=str,
+                        help=("The base command to run the Wallaroo "
+                              "application. e.g. 'machida --application-module"
+                              " reverse'."))
+
+    log_group = parser.add_argument_group('Logging')
+    log_group.add_argument('--log-file', help=("Save integration test output"
+                           " to file."), action=SetLogFile)
+    log_group.add_argument('--log-level', help=("Set the logging level."),
+                           choices=['none', '1', 'debug', 'info', 'warning',
+                                    'error', 'critical'],
+                           default='info')
+    log_group.add_argument("--save-test-output", help=("Save the test output "
+                           "to files in tmp/wallaroo_test_errors"),
+                           action="store_true")
+
+    term_group = parser.add_argument_group('Termination')
+    term_group.add_argument('--runner-join_timeout', type=float, default=90,
+                            help=("Timeout in seconds before killing any "
+                                  "remaining live workers and raising an "
+                                  "error."))
+    term_group.add_argument('--max-retries', type=int, default=5,
+                            help=("Max number of times to attempt the test"
+                                  " if it fails due a "
+                                  "RunnerHasntStartedError"))
+
+    args = parser.parse_args()
+    log_level = get_log_level(args.log_level)
+    set_logging(name='integration', level=log_level)
+
+    # If --validation-cmp, make sure expected_val is not None
+    if args.validation_cmp:
+        if args.expected_file:
+            args.expected_val = open(args.expected_file, 'rb')
+        if not args.expected_val:
+            parser.error("either '--expected-csv', '--expected-string' "
+                         "or '--expected-file' must be used with "
+                         "'--validation-cmp'.")
+    if args.validation_cmd:
+        if not args.output:
+            parser.error("'--output' is required with '--validation-cmd'")
+    else:
+        validation_cmd = None
+
+
+    t0 = datetime.datetime.now()
+    log_stream = add_in_memory_log_stream(level=logging.DEBUG)
+    cwd = os.getcwd()
+    trunc_head = cwd.find('/wallaroo/') + len('/wallaroo/')
+    base_dir = '/tmp/wallaroo_test_errors/{}/{}'.format(
+        cwd[trunc_head:],
+        t0.strftime('%Y%m%d_%H%M%S'))
+    persistent_data = {}
+
+
+    # Run the test!
+    attempt = 0
+    try:
+        while True:
+            attempt += 1
+            try:
+                # clean up data collection before each attempt
+                persistent_data.clear()
+                log_stream.seek(0)
+                log_stream.truncate()
+
+                # start test attempt
+                logging.info("Integration test attempt {}".format(attempt))
+                logging.debug("Running integration test with the following"
+                              " options:")
+                for k, v in args._get_kwargs():
+                    logging.debug('%s: %r' % (k, v))
+                pipeline_test(
+                    expected = args.expected_val,
+                    command = args.command,
+                    workers = args.workers,
+                    sources = args.sources, # list of (generator, source_name) tuples
+                    sinks = args.sinks,
+                    mode = args.sink_mode,
+                    batch_size = args.batch_size,
+                    sender_interval = args.sender_interval,
+                    sink_expect = args.sink_expect,
+                    sink_expect_allow_more = args.sink_expect_allow_more,
+                    sink_stop_timeout = args.sink_stop_timeout,
+                    sink_await = args.sink_await,
+                    sink_await_keys = args.sink_await_keys,
+                    delay = args.delay,
+                    output_file = args.output,
+                    validation_cmd = args.validation_cmd,
+                    host=args.host,
+                    runner_join_timeout=args.runner_join_timeout,
+                    resilience_dir=args.resilience_dir,
+                    spikes=args.spike,
+                    persistent_data = persistent_data,
+                    log_error = False)
+                # Test run was successful, break out of loop and proceed to
+                # validation
+                logging.info("Run phase complete. Proceeding to validation.")
+                break
+            except RunnerHasntStartedError:
+                logging.warning("Runner failed to start properly.")
+                if attempt < args.max_retries:
+                    logging.info("Restarting the test!")
+                    time.sleep(0.5)
+                    continue
+                else:
+                    logging.error("Max retry attempts reached.")
+                    raise
+            except:
+                raise
+    except Exception as err:
+        logging.exception("Encountered an error while running the test for"
+                          " %r\n===\n" % args.command)
+        # Save logs to file in case of error
+        try:
+            save_logs_to_file(base_dir, log_stream, persistent_data)
+        except Exception as err:
+            logging.warning("failed to save logs to file")
+            logging.exception(err)
+        parser.exit(1)
+
+    # Reached the end and nothing broke. Success!
+    logging.info("Integration test completed successfully for command %r" %
+                 args.command)
+
+    if args.save_test_output:
+        logging.info("Saving test output data to files")
+        save_logs_to_file(base_dir, log_stream, persistent_data)
+
+if __name__ == '__main__':
+    CLI()

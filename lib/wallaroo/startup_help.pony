@@ -24,13 +24,11 @@ primitive StartupHelp
       -------------------------------------------------------------------------
       Wallaroo takes the following parameters:
       -------------------------------------------------------------------------
-        --in/-i [Comma-separated list of input addresses sources listen on]
         --control/-c [Sets address for initializer control channel; sets
           control address to connect to for non-initializers]
         --data/-d [Sets address for initializer data channel]
         --my-control [Optionally sets address for my control channel]
         --my-data [Optionally sets address for my data channel]
-        --phone-home/-p [Sets address for phone home connection]
         --external/-e [Sets address for external message channel]
         --worker-count/-w [Sets cluster initializer's total number of workers,
           including cluster initializer itself]
@@ -41,6 +39,13 @@ primitive StartupHelp
           initializing process (that status is meaningless after init is done)]
         --resilience-dir/-r [Sets directory to write resilience files to,
           e.g. -r /tmp/data (no trailing slash)]
+        --resilience-dos-server [Comma-separated list of hostname:port of the remote DOS server(s)]
+        --resilience-enable-io-journal [Enables the write-ahead logging
+          of all file I/O (regardless of resilience build type)]
+        --resilience-no-local-file-io [Disables local file I/O; writes to I/O
+          journal are not affected by this flag]
+        --run-with-resilience [Enables resilience. Required (and only works)
+          if the Wallaroo binary was built in resilience mode.]
         --log-rotation [Enables log rotation. Default: off]
         --event-log-file-size/-l [Optionally sets rotation size for the event
           log file backend]
@@ -48,8 +53,10 @@ primitive StartupHelp
         --join/-j [When a new worker is joining a running cluster, pass the
           control channel address of any worker as the value for this
           parameter]
-        --stop-world/-u [Sets pause before state migration after stop the
+        --stop-pause/-u [Sets pause before state migration after stop the
           world]
+        --time-between-checkpoints [Sets the interval between checkpoints for
+          resilience (in nanoseconds)]
 
       -------------------------------------------------------------------------
       To set Wallaroo modes, compile with the following -D flags:

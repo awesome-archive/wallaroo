@@ -1,249 +1,192 @@
-# Wallaroo
+<p align="center"><a href="https://www.wallaroolabs.com/"><img src="wallaroo-logo.png" alt="WallarooLabs logo" width="400"/></a></p>
+<h2 align="center">Build and scale real-time applications</h2>
 
-Wallaroo is a fast, elastic data processing engine that rapidly takes you from prototype to production by eliminating infrastructure complexity.
+---
+[![CircleCI](https://circleci.com/gh/WallarooLabs/wallaroo.svg?style=shield)](https://circleci.com/gh/WallarooLabs/wallaroo)
+[![GitHub license](https://img.shields.io/badge/license-apache%202-blue.svg)][wallaroo-license-readme]
+[![GitHub version](https://badge.fury.io/gh/WallarooLabs%2Fwallaroo.svg)](http://badge.fury.io/gh/WallarooLabs%2Fwallaroo)
+[![IRC][irc-badge]][irc-link]
+[![Groups.io][group-badge]][group-link]
 
-- [What is Wallaroo?][what is wallaroo section]
-- [Status][status section]
-- [Getting Started][getting started section]
-- [Documentation][documentation section]
-- [Getting Help][getting help section]
-- [How to Contribute][contribute section]
-- [License][license section]
-- [Frequently Asked Questions][FAQ]
-- [Additional Links][additional links]
-- [About this Repository][about this repository section]
+A fast, stream-processing framework. Wallaroo makes it easy to react to data in real-time. By eliminating infrastructure complexity, going from prototype to production has never been simpler.
 
 ## What is Wallaroo?
 
-Wallaroo is a fast and elastic data processing engine that rapidly takes you from prototype to production by making the infrastructure virtually disappear. We’ve designed it to handle demanding high-throughput, low-latency tasks where the accuracy of results is essential. Wallaroo takes care of mechanics of scaling, resilience, state management, and message delivery. We've designed Wallaroo to make it easy scale applications with no code changes, and allow programmers to focus on business logic. You can learn more about Wallaroo from our ["Hello Wallaroo!" blog post][hello wallaroo post].
+When we set out to build Wallaroo, we had several high-level goals in mind:
 
-We've done a [15-minute video of our engineering presentation][scale independence with wallaroo] that has helped people understand what Wallaroo is. If you watch it, you will get:
+- Create a dependable and resilient distributed computing framework
+- Take care of the complexities of distributed computing "plumbing," allowing developers to focus on their business logic
+- Provide high-performance & low-latency data processing
+- Be portable and deploy easily (i.e., run on-prem or any cloud)
+- Manage in-memory state for the application
+- Allow applications to scale as needed, even when they are live and up-and-running
 
-- An overview of the problem we are solving with our Scale-Independent API
-- A short intro to the Python API
-- A demonstration of our Autoscale functionality (for stateful applications)
-- To see the power of Scale-Independent APIs in action
-
-### Features
-
-- [State Management][state management website]
-- [Scale running stateful applications with zero downtime][autoscaling website]
-- [Resilience in the face of failures][resilience website]
-- [Exactly-once message processing][exactly-once website]
-
-### Language Bindings
-
-Existing language bindings: 
-
-- Python 2.7
-- C++
-- Pony
-
-Planned Language bindings:
-
-- Python 3
-- Go
-- JavaScript
-
-Please see [status][status section] for language binding support details. Wallaroo is open source software with an expanding software community. Please see the [How to Contribute][contribute section] section if you wish to help support your favorite data analysis language.
-
-### Supported platforms
-
-- Linux
-- MacOS
-
-Wallaroo is open source software with an expanding software community. Please see the [How to Contribute][contribute section] section if you wish to help support your favorite operating system.
-
-### Deployment model
-
-Wallaroo applications are user hosted. It's equally at home "in the cloud" or "on-premise."
-
-We have no "as a service" offering at this time. 
-
-### Roadmap
-
-Interested in where we are taking Wallaroo? Check out our [roadmap][roadmap].
-
-## Status
-
-### Language bindings
-
-- Pony
-
-Wallaroo is primarily written in Pony. As such, Pony is the first language to receive support for any given feature. We don't expect the Pony API to get much usage outside of Wallaroo Labs. We aren't maintaining any documentation for the Pony API outside of a [few examples][pony examples]. You are welcome to use the Pony API but are going to mostly be on your own documentation wise.
-
-- Python 2.7
-
-Currently, Python 2.7 is our primary focus. As we add features to the Wallaroo, we will be adding corresponding Python APIs and documentation.
-
-- Python 3
-
-We are currently working with a client who needs Python 3 bindings. We plan to introduce Python 3 bindings by the end of 2017. 
-
-- C++
-
-C++ was our first non-Pony API. Since that time we have learned a lot about writing Wallaroo language bindings. We plan on revisiting the C++ API in the near future to improve its ergonomics. If you are interested in using Wallaroo with C++, you should [contact us][contact us email]. We're happy to work with you.
-
-- Go
-
-We are currently working with a client who needs Go bindings. We plan to introduce Go bindings by the end of 2017. 
-
-- JavaScript 
-
-JavaScript support is currently in the planning stages with a release in 2018.
-
-### Limitations
-
-We have [numerous issues open][open issues] to improve existing Wallaroo functionality. For a high-level overview, please see our [current limitations document][current limitations].
+You can learn more about [Wallaroo][home-page] from our ["Hello Wallaroo!" blog post][hello-wallaroo-post] and the [Wallaroo overview video][overview-video].
 
 ## Getting Started
 
-Are you the sort who just wants to get going? Dive right into our [documentation][documentation website] then! It will get you up and running with Wallaroo.
+Wallaroo can be installed via our handy Wallaroo Up command. Check out our [installation][installation-options] page to learn more.
+
+## APIs
+
+The primary API for Wallaroo is written in [Pony][pony]. If you are interested in writing Wallaroo applications in other high-performance languages such as C, C++ or Rust, [drop us a line][commercial-support-email]; we'd be happy to engage on a commercial basis in creating language bindings that meet your needs.
+
+## Usage
+
+Once you've installed Wallaroo, Take a look at some of our examples. A great place to start are our [word_count][word_count] or [market spread][market-spread] examples in [Pony](pony-examples).
+
+```pony
+"""
+Word Count App
+"""
+use "assert"
+use "buffered"
+use "collections"
+use "net"
+use "serialise"
+use "wallaroo_labs/bytes"
+use "wallaroo"
+use "wallaroo_labs/logging"
+use "wallaroo_labs/mort"
+use "wallaroo_labs/time"
+use "wallaroo/core/common"
+use "wallaroo/core/metrics"
+use "wallaroo/core/sink/tcp_sink"
+use "wallaroo/core/source"
+use "wallaroo/core/source/tcp_source"
+use "wallaroo/core/state"
+use "wallaroo/core/topology"
+
+actor Main
+  new create(env: Env) =>
+    Log.set_defaults()
+    try
+      let pipeline = recover val
+        let lines = Wallaroo.source[String]("Word Count",
+          TCPSourceConfig[String].from_options(StringFrameHandler,
+                TCPSourceConfigCLIParser("Word Count", env.args)?, 1))
+
+        lines
+          .to[String](Split)
+          .key_by(ExtractWord)
+          .to[RunningTotal](AddCount)
+          .to_sink(TCPSinkConfig[RunningTotal].from_options(
+            RunningTotalEncoder, TCPSinkConfigCLIParser(env.args)?(0)?))
+      end
+      Wallaroo.build_application(env, "Word Count", pipeline)
+    else
+      @printf[I32]("Couldn't build topology\n".cstring())
+    end
+
+primitive Split is StatelessComputation[String, String]
+  fun name(): String => "Split"
+
+  fun apply(s: String): Array[String] val =>
+    let punctuation = """ !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~ """
+    let words = recover trn Array[String] end
+    for line in s.split("\n").values() do
+      let cleaned =
+        recover val s.clone().>lower().>lstrip(punctuation)
+          .>rstrip(punctuation) end
+      for word in cleaned.split(punctuation).values() do
+        words.push(word)
+      end
+    end
+    consume words
+
+class val RunningTotal
+  let word: String
+  let count: U64
+
+  new val create(w: String, c: U64) =>
+    word = w
+    count = c
+
+class WordTotal is State
+  var count: U64
+
+  new create(c: U64) =>
+    count = c
+
+primitive AddCount is StateComputation[String, RunningTotal, WordTotal]
+  fun name(): String => "Add Count"
+
+  fun apply(word: String, state: WordTotal): RunningTotal =>
+    state.count = state.count + 1
+    RunningTotal(word, state.count)
+
+  fun initial_state(): WordTotal =>
+    WordTotal(0)
+
+primitive StringFrameHandler is FramedSourceHandler[String]
+  fun header_length(): USize =>
+    4
+
+  fun payload_length(data: Array[U8] iso): USize ? =>
+    Bytes.to_u32(data(0)?, data(1)?, data(2)?, data(3)?).usize()
+
+  fun decode(data: Array[U8] val): String =>
+    String.from_array(data)
+
+primitive ExtractWord
+  fun apply(input: String): Key =>
+    input
+
+primitive RunningTotalEncoder
+  fun apply(t: RunningTotal, wb: Writer = Writer): Array[ByteSeq] val =>
+    let result =
+      recover val
+        String().>append(t.word).>append(", ").>append(t.count.string())
+          .>append("\n")
+      end
+    @printf[I32]("!!%s".cstring(), result.cstring())
+    wb.write(result)
+
+    wb.done()
+```
 
 ## Documentation
 
-Our primary documentation is hosted by GitBook at [http://docs.wallaroolabs.com][documentation website]. You can find additional information on our [community site][community website].
+Are you the sort who just wants to get going? Dive right into our [documentation][documentation] then! It will get you up and running with Wallaroo.
 
-## Getting Help
+More information is also on our [blog][blog-link]. There you can find more insight into what we are working on and industry use-cases.
 
-- [Join us on Freenode in #wallaroo][IRC]. 
-- [Join our developer mailing list][developer mailing list].
-- [Commercial support][contact us email]
+> Wallaroo currently exists as a mono-repo. All the source that is Wallaroo is located in this repo. See [repo directory structure][repo-directory-structure-link] for more information.
 
-## How to Contribute
+You can also take a look at our [FAQ][faq].
 
-We're an open source project and welcome contributions. Trying to figure out how to get started? Drop us a line on [IRC][IRC] or the [developer mailing list][developer mailing list], and we can get you started.
+## Need Help?
 
-Be sure to check out our [contributors guide][contributors guide] before you get started.
+Trying to figure out how to get started? Drop us a line:
+
+- [Mailing List][group-link]
+- [Commercial Support][commercial-support-email]
+
+## Contributing
+
+We welcome contributions. Please see our [Contribution Guide][contribution-guide]
+
+> For your pull request to be accepted you will need to accept our [Contributor License Agreement][cla]
 
 ## License
 
-Wallaroo is an open source project. All of the source code is available to you. Most of the Wallaroo code base is available under the [Apache License, version 2][apache 2 license]. However, not all of the Wallaroo source code is a[Apache 2[apache 2 license] licensed. Parts of Wallaroo are licensed under the [Wallaroo Community License Agreement][wallaroo community license]. Source files in this repository have a header indicating which license they are under. 
+Wallaroo is licensed under the [Apache version 2][apache-2-license] license.
 
-The core stream processing engine and state management facilities are all licensed under the the [Apache version 2][apache 2 license]. Autoscaling, exactly-once message processing and resiliency features are licensed under the [Wallaroo Community License Agreement][wallaroo community license].
-
-The [Wallaroo Community License][wallaroo community license] is based on [Apache version 2][apache 2 license]. However, you should read it for yourself. Here we provide a summary of the main points of the [Wallaroo Community License Agreement][wallaroo community license].
-
-- You can **run** all Wallaroo code in a non-production environment without restriction.
-- You can **run** all Wallaroo code in a production environment for free on up to 3 server or 24 cpus.
-- If you want to **run** Wallaroo Enterprise version features in production above 3 servers or 24 cpus, you have to obtain a license.
-- You can **modify** and **redistribute** any Wallaroo code
-- Anyone who uses your **modified** or **redistributed** code is bound by the same license and needs to obtain a Wallaroo Enterprise license to run on more than 3 servers or 24 cpus in a production environment. 
-
-
-
-Please [contact us][contact us email] if you have any questions about licensing or Wallaroo Enterprise.
-
-## Additional Links
-
-- [Scale-Independence with Wallaroo][scale independence with wallaroo]
-
-15 minute overview of key Wallaroo features. Includes actual code and a demonstration of our stateful autoscaling functionality.
-
-- [Open Sourcing Wallaroo][open sourcing wallaroo]
-
-Our open source annoucement.
-
-- [Hello Wallaroo!][hello wallaroo post]
-
-An introduction to Wallaroo.
-
-- [What's the "Secret Sauce"][secret sauce post]
-
-A look inside Wallaroo's excellent performance
-
-- [Wallaroo Labs][wallaroo labs website]
-
-The company behind Wallaroo.
-
-- [Documentation][documentation website]
-
-Wallaroo documentation.
-
-- QCon NY 2016: [How did I get here? Building Confidence in a Distributed Stream Processor][qcon16 how did i get here]
-- CodeMesh 2016:[How did I get here? Building Confidence in a Distributed Stream Processor][codemesh16 how did i get here]
-
-Our VP of Engineering Sean T. Allen talks about one of the techniques we use to test Wallaroo.
-
-- [Wallaroo Labs Twitter][twitter]
-
-## About this Repository
-
-Wallaroo currently exists as a mono-repo. All the source that makes Wallaroo go is in this repo. Let's take a quick walk through what you'll find in each top-level directory:
-
-- book
-
-Markdown source used to build [http://docs.wallaroolabs.com][documentation website]. [http://docs.wallaroolabs.com][documentation website] gets built from the latest commit to the `release` branch. There's also ["Wallaroo-Latest" documentation][unstable documentation website]. "Wallaroo-Latest" is built from master so it will be as up to date as possible. Be aware many of the external links in our documentation point to the `release` branch. "Wallaroo-Latest" is intended only for the most adventurous amongst us.
-
-- cpp_api
-
-Code for writing Wallaroo applications using C++. This is currently unsupported.
-
-- examples
-
-Wallaroo example applications in a variety of languages. Currently, only the Python API examples are supported. See [status section][status section] for details.
-
-- giles
-
-TCP utility applications that can stream data over TCP to Wallaroo applications and receive TCP streams from said applications. 
-
-- lib
-
-The Pony source code that makes up Wallaroo.
-
-- machida
-
-Python runner application. Machida embeds a Python interpreter inside a native Wallaroo binary and allows you to run applications using the Wallaroo Python API.
-
-- monitoring hub
-
-Source for the Wallaroo metrics UI.
-
-- orchestration
-
-Tools we use to create machines in AWS and other environments.
-
-- testing
-
-Tools we have written that are used to test Wallaroo.
-
-- utils
-
-End user utilities designed to make it easier to do various Wallaroo tasks like cleanly shut down a cluster.
-
-[about this repository section]: #about-this-repository 
-[additional links]: #additional-links
-[apache 2 license]: https://www.apache.org/licenses/LICENSE-2.0
-[autoscaling website]: http://www.wallaroolabs.com/technology/autoscaling
-[codemesh16 how did i get here]: https://www.youtube.com/watch?v=6MsPDtpe2tg
-[community website]: http://www.wallaroolabs.com/community
-[contact us email]: mailto:hello@wallaroolabs.com
-[contribute section]: #how-to-contribute
-[contributors guide]: CONTRIBUTING.md
-[current limitations]: LIMITATIONS.md
-[developer mailing list]: https://groups.io/g/wallaroo
-[documentation section]: #documentation
-[documentation website]: http://docs.wallaroolabs.com
-[exactly-once website]: http://www.wallaroolabs.com/technology/exactly-once
-[FAQ]: http://www.wallaroolabs.com/faq
-[getting help section]: #getting-help
-[getting started section]: #getting-started
-[hello wallaroo post]: https://blog.wallaroolabs.com/2017/03/hello-wallaroo/
-[IRC]: https://webchat.oftc.net/?channels=wallaroo
-[license section]: #license
-[open issues]: https://github.com/WallarooLabs/wallaroo/issues
-[open sourcing wallaroo]: https://blog.wallaroolabs.com/2017/09/open-sourcing-wallaroo/
-[pony examples]: examples/pony
-[qcon16 how did i get here]: https://www.infoq.com/presentations/trust-distributed-systems
-[scale independence with wallaroo]: https://vimeo.com/234753585
-[resilience website]: http://www.wallaroolabs.com/technology/exactly-once
-[roadmap]: ROADMAP.md
-[secret sauce post]: https://blog.wallaroolabs.com/2017/06/whats-the-secret-sauce/
-[state management website]: http://www.wallaroolabs.com/technology/state-management
-[status section]: #status
-[twitter]: https://www.twitter.com/wallaroolabs
-[unstable documentation website]: https://www.gitbook.com/book/wallaroo-labs/wallaroo-latest/details
-[wallaroo community license]: LICENSE.md
-[wallaroo labs website]: https://www.wallaroolabs.com
-[what is wallaroo section]: #what-is-wallaroo
-
+[apache-2-license]: https://www.apache.org/licenses/LICENSE-2.0
+[repo-directory-structure-link]: MONOREPO.md
+[blog-link]: https://blog.wallaroolabs.com/
+[cla]: https://gist.github.com/WallarooLabsTeam/e06d4fed709e0e7035fdaa7249bf88fb
+[commercial-support-email]: mailto:sales@wallaroolabs.com
+[contribution-guide]: CONTRIBUTING.md
+[documentation]: https://docs.wallaroolabs.com/
+[faq]: https://wallaroolabs.com/faq
+[group-badge]: https://img.shields.io/badge/mailing%20list-join%20%E2%86%92-%23551A8B.svg
+[group-link]: https://groups.io/g/wallaroo
+[hello-wallaroo-post]: https://blog.wallaroolabs.com/2017/03/hello-wallaroo/
+[home-page]: https://www.wallaroolabs.com/
+[installation-options]: https://docs.wallaroolabs.com/pony-installation
+[word_count]: examples/pony/word_count/
+[market-spread]: examples/pony/market_spread/
+[pony]: https://www.ponylang.io/
+[pony-examples]: examples/pony/
+[wallaroo-license-readme]: #license

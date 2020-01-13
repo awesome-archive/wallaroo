@@ -21,9 +21,9 @@ use "ponytest"
 use "wallaroo_labs/equality"
 use "wallaroo/core/boundary"
 use "wallaroo/core/common"
-use "wallaroo/ent/data_receiver"
-use "wallaroo/ent/network"
-use "wallaroo/ent/recovery"
+use "wallaroo/core/data_receiver"
+use "wallaroo/core/network"
+use "wallaroo/core/recovery"
 use "wallaroo/core/metrics"
 use "wallaroo/core/routing"
 
@@ -36,4 +36,4 @@ actor Main is TestList
 
   fun tag tests(test: PonyTest) =>
     _TestRouterEquality.make().tests(test)
-    _TestStepSeqIdGenerator.make().tests(test)
+    _StateRunnerTests.make().tests(test)

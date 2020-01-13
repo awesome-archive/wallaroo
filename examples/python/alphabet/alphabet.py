@@ -12,36 +12,33 @@
 #  implied. See the License for the specific language governing
 #  permissions and limitations under the License.
 
+"""
+This is an example application that takes "votes" for different letters of
+the alphabet and keeps a running total of the votes received for each
+letter. For each incoming message, it sends out a message with the total
+votes for that letter. The total number of votes for each letter are stored
+together in a single state object.
+"""
 
 import struct
-import pickle
 
 import wallaroo
 
 
 def application_setup(args):
-    in_host, in_port = wallaroo.tcp_parse_input_addrs(args)[0]
+    in_name, in_host, in_port = wallaroo.tcp_parse_input_addrs(args)[0]
     out_host, out_port = wallaroo.tcp_parse_output_addrs(args)[0]
 
-    ab = wallaroo.ApplicationBuilder("alphabet")
-    ab.new_pipeline("alphabet",
-                    wallaroo.TCPSourceConfig(in_host, in_port, Decoder()))
-    ab.to_stateful(AddVotes(), LetterStateBuilder(), "letter state")
-    ab.to_sink(wallaroo.TCPSinkConfig(out_host, out_port, Encoder()))
-    return ab.build()
+    votes = wallaroo.source("alphabet",
+                       wallaroo.TCPSourceConfig(in_name, in_host, in_port,
+                                                decode_votes))
 
+    pipeline = (votes
+        .key_by(extract_letter)
+        .to(add_votes)
+        .to_sink(wallaroo.TCPSinkConfig(out_host, out_port, encode_votes)))
 
-def serialize(o):
-    return pickle.dumps(o)
-
-
-def deserialize(bs):
-    return pickle.loads(bs)
-
-
-class LetterStateBuilder(object):
-    def build(self):
-        return AllVotes()
+    return wallaroo.build_application("alphabet", pipeline)
 
 
 class Votes(object):
@@ -57,7 +54,6 @@ class AllVotes(object):
     def update(self, votes):
         letter = votes.letter
         vote_count = votes.votes
-
         votes_for_letter = self.votes_by_letter.get(letter, Votes(letter, 0))
         votes_for_letter.votes += vote_count
         self.votes_by_letter[letter] = votes_for_letter
@@ -68,28 +64,24 @@ class AllVotes(object):
         return Votes(letter, vbl.votes)
 
 
-class Decoder(object):
-    def header_length(self):
-        return 4
-
-    def payload_length(self, bs):
-        return struct.unpack(">I", bs)[0]
-
-    def decode(self, bs):
-        (letter, vote_count) = struct.unpack(">sI", bs)
-        return Votes(letter, vote_count)
+@wallaroo.key_extractor
+def extract_letter(data):
+    return data.letter
 
 
-class AddVotes(object):
-    def name(self):
-        return "add votes"
-
-    def compute(self, data, state):
-        state.update(data)
-        return (state.get_votes(data.letter), True)
+@wallaroo.decoder(header_length=4, length_fmt=">I")
+def decode_votes(bs):
+    (letter, vote_count) = struct.unpack(">sI", bs)
+    letter = letter.decode("utf-8")  # for Python3 comptibility
+    return Votes(letter, vote_count)
 
 
-class Encoder(object):
-    def encode(self, data):
-        # data is a Votes
-        return struct.pack(">IsQ", 9, data.letter, data.votes)
+@wallaroo.state_computation(name="add votes", state=AllVotes)
+def add_votes(data, state):
+    state.update(data)
+    return state.get_votes(data.letter)
+
+
+@wallaroo.encoder
+def encode_votes(votes):
+    return ("%s => %d\n" % (votes.letter, votes.votes)).encode()

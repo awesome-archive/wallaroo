@@ -24,14 +24,12 @@ This package represents the unit test suite for Wallaroo.
 All tests can be run by compiling and running this package.
 """
 use "ponytest"
-use cluster_manager = "ent/cluster_manager"
-use data_channel = "core/data_channel"
+use cluster_manager = "core/cluster_manager"
 use initialization = "core/initialization"
-use rebalancing = "ent/rebalancing"
-use recovery = "ent/recovery"
-use spike = "ent/spike"
+use recovery = "core/recovery"
+use step = "core/step"
 use topology = "core/topology"
-use watermarking = "ent/watermarking"
+use windows = "core/windows"
 
 actor Main is TestList
   new create(env: Env) =>
@@ -42,10 +40,8 @@ actor Main is TestList
 
   fun tag tests(test: PonyTest) =>
     cluster_manager.Main.make().tests(test)
-    data_channel.Main.make().tests(test)
     initialization.Main.make().tests(test)
-    rebalancing.Main.make().tests(test)
     recovery.Main.make().tests(test)
-    spike.Main.make().tests(test)
+    step.Main.make().tests(test)
     topology.Main.make().tests(test)
-    watermarking.Main.make().tests(test)
+    windows.Main.make().tests(test)

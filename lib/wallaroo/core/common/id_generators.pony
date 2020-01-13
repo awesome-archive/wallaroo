@@ -16,6 +16,8 @@ Copyright 2017 The Wallaroo Authors.
 
 */
 
+use "buffered"
+use "crypto"
 use "wallaroo_labs/guid"
 
 class MsgIdGenerator
@@ -24,14 +26,21 @@ class MsgIdGenerator
   fun ref apply(): MsgId =>
     _guid.u128()
 
-class StepIdGenerator
+class RoutingIdGenerator
   let _guid: GuidGenerator = GuidGenerator
 
-  fun ref apply(): StepId =>
+  fun ref apply(): RoutingId =>
     _guid.u128()
 
-class RouteIdGenerator
+class RequestIdGenerator
   let _guid: GuidGenerator = GuidGenerator
 
-  fun ref apply(): RouteId =>
-    _guid.u64()
+  fun ref apply(): RequestId =>
+    _guid.u128()
+
+primitive RoutingIdFromStringGenerator
+  fun apply(text: String): RoutingId ? =>
+    let temp_id = MD5(text)
+    let rb = Reader
+    rb.append(temp_id)
+    rb.u128_le()?

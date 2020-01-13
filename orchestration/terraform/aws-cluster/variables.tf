@@ -18,6 +18,16 @@ variable "aws_region" {
   default = "us-east-1"
 }
 
+variable "terraform_state_aws_region" {
+  description = "AWS region for terraform state."
+  default = "us-east-1"
+}
+
+variable "terraform_state_aws_bucket" {
+  description = "AWS bucket for terraform state."
+  default = "sendence-dev"
+}
+
 variable "aws_subnet_id" {
   description = "AWS subnet_id to launch servers."
   default = ""
@@ -116,16 +126,17 @@ variable "instance_volume_size" {
 variable "instance_amis" {
   description = "AMI for all instances."
   default = {
-    sa-east-1 = "ami-78a93c14"
-    us-west-1 = "ami-b20542d2"
-    us-west-2 = "ami-b9ff39d9"
-    us-east-1 = "ami-ddf13fb0"
-    eu-west-1 = "ami-a4d44ed7"
-    ap-southeast-1 = "ami-fc37e59f"
-    ap-southeast-2 = "ami-a387afc0"
-    eu-central-1 = "ami-26e70c49"
-    ap-northeast-1 = "ami-b7d829d6"
-    ap-south-1 = "ami-7e94fe11"
+    sa-east-1 = "ami-9188c0fd"
+    us-west-1 = "ami-9abbb3fa"
+    us-west-2 = "ami-0ee66876"
+    us-east-1 = "ami-ee4eac93"
+    us-east-2 = "ami-b84c7bdd"
+    eu-west-1 = "ami-cc166eb5"
+    ap-southeast-1 = "ami-c52b62b9"
+    ap-southeast-2 = "ami-4ef83f2c"
+    eu-central-1 = "ami-4d6c0e22"
+    ap-northeast-1 = "ami-06d9a360"
+    ap-south-1 = "ami-5383df3c"
   }
 }
 

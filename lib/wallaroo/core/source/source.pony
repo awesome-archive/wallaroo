@@ -17,88 +17,54 @@ Copyright 2017 The Wallaroo Authors.
 */
 
 use "collections"
+use "promises"
+use "wallaroo/core/barrier"
 use "wallaroo/core/boundary"
+use "wallaroo/core/checkpoint"
 use "wallaroo/core/common"
-use "wallaroo/ent/data_receiver"
-use "wallaroo/ent/recovery"
+use "wallaroo/core/data_receiver"
+use "wallaroo/core/messages"
 use "wallaroo/core/metrics"
+use "wallaroo/core/partitioning"
+use "wallaroo/core/recovery"
 use "wallaroo/core/routing"
 use "wallaroo/core/topology"
 
-trait val SourceBuilder
-  fun name(): String
-  fun apply(event_log: EventLog, auth: AmbientAuth, target_router: Router):
-    SourceNotify iso^
-  fun val update_router(router: Router): SourceBuilder
+type SourceName is String
 
-class val BasicSourceBuilder[In: Any val, SH: SourceHandler[In] val] is SourceBuilder
-  let _app_name: String
-  let _worker_name: String
+interface val SourceConfig
+  fun default_partitioner_builder(): PartitionerBuilder
+  fun val source_coordinator_builder_builder(): SourceCoordinatorBuilderBuilder
+  fun worker_source_config(): WorkerSourceConfig
+
+interface val TypedSourceConfig[In: Any val] is SourceConfig
+
+class val SourceConfigWrapper
   let _name: String
-  let _runner_builder: RunnerBuilder
-  let _handler: SH
-  let _router: Router
-  let _metrics_conn: MetricsSink
-  let _pre_state_target_id: (U128 | None)
-  let _metrics_reporter: MetricsReporter
-  let _source_notify_builder: SourceNotifyBuilder[In, SH]
+  let _source_config: SourceConfig
 
-  new val create(app_name: String, worker_name: String,
-    name': String,
-    runner_builder: RunnerBuilder,
-    handler: SH,
-    router: Router, metrics_conn: MetricsSink,
-    pre_state_target_id: (U128 | None) = None,
-    metrics_reporter: MetricsReporter iso,
-    source_notify_builder: SourceNotifyBuilder[In, SH])
-  =>
-    _app_name = app_name
-    _worker_name = worker_name
-    _name = name'
-    _runner_builder = runner_builder
-    _handler = handler
-    _router = router
-    _metrics_conn = metrics_conn
-    _pre_state_target_id = pre_state_target_id
-    _metrics_reporter = consume metrics_reporter
-    _source_notify_builder = source_notify_builder
+  new val create(n: String, sc: SourceConfig) =>
+    _name = n
+    _source_config = sc
 
   fun name(): String => _name
+  fun source_config(): SourceConfig => _source_config
 
-  fun apply(event_log: EventLog, auth: AmbientAuth, target_router: Router):
-    SourceNotify iso^
-  =>
-    _source_notify_builder(_name, auth, _handler, _runner_builder, _router,
-      _metrics_reporter.clone(), event_log, target_router, _pre_state_target_id)
+trait val WorkerSourceConfig
 
-  fun val update_router(router: Router): SourceBuilder =>
-    BasicSourceBuilder[In, SH](_app_name, _worker_name, _name, _runner_builder,
-      _handler, router, _metrics_conn, _pre_state_target_id,
-      _metrics_reporter.clone(), _source_notify_builder)
-
-interface val SourceBuilderBuilder
-  fun name(): String
-  fun apply(runner_builder: RunnerBuilder, router: Router,
-    metrics_conn: MetricsSink, pre_state_target_id: (U128 | None) = None,
-    worker_name: String,
-    metrics_reporter: MetricsReporter iso):
-      SourceBuilder
-
-interface val SourceConfig[In: Any val]
-  fun source_listener_builder_builder(): SourceListenerBuilderBuilder
-
-  fun source_builder(app_name: String, name: String):
-    SourceBuilderBuilder
-
-interface tag Source is DisposableActor
-  be update_router(router: PartitionRouter)
+trait tag Source is (Producer & DisposableActor & BoundaryUpdatable &
+  StatusReporter)
+  // TODO: Rename register_downstreams
+  be register_downstreams(promise: Promise[Source])
+  be update_router(router: StatePartitionRouter)
+  be remove_route_to_consumer(id: RoutingId, c: Consumer)
   be add_boundary_builders(
     boundary_builders: Map[String, OutgoingBoundaryBuilder] val)
-  be reconnect_boundary(target_worker_name: String)
-  be mute(c: Consumer)
-  be unmute(c: Consumer)
-
-interface tag SourceListener is DisposableActor
-  be update_router(router: PartitionRouter)
-  be add_boundary_builders(
-    boundary_builders: Map[String, OutgoingBoundaryBuilder] val)
+  be reconnect_boundary(target_worker_name: WorkerName)
+  be disconnect_boundary(worker: WorkerName)
+  be mute(a: Any tag)
+  be unmute(a: Any tag)
+  be initiate_barrier(token: BarrierToken)
+  be checkpoint_complete(checkpoint_id: CheckpointId)
+  be update_worker_data_service(worker_name: String,
+    host: String, service: String)

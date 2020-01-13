@@ -22,56 +22,64 @@ use "wallaroo/core/sink/kafka_sink"
 use "wallaroo/core/source"
 use "wallaroo/core/source/kafka_source"
 use "wallaroo/core/topology"
+use "wallaroo_labs/logging"
 
 actor Main
   new create(env: Env) =>
+    Log.set_defaults()
+    let ksource_clip = KafkaSourceConfigCLIParser(env.out)
+    let ksink_clip = KafkaSinkConfigCLIParser(env.out)
+
     try
-      if (env.args(1) == "--help") or (env.args(1) == "-h") then
-        KafkaSourceConfigCLIParser.print_usage(env.out)
-        KafkaSinkConfigCLIParser.print_usage(env.out)
+      if (env.args(1)? == "--help") or (env.args(1)? == "-h") then
+        ksource_clip.print_usage()
+        ksink_clip.print_usage()
         return
       end
     else
-      KafkaSourceConfigCLIParser.print_usage(env.out)
-      KafkaSinkConfigCLIParser.print_usage(env.out)
+      ksource_clip.print_usage()
+      ksink_clip.print_usage()
       return
     end
 
     try
-      let application = recover val
-        Application("Celsius Conversion App")
-          .new_pipeline[F32, F32]("Celsius Conversion",
-            KafkaSourceConfig[F32](KafkaSourceConfigCLIParser(env.args, env.out)
-              , env.root as AmbientAuth, CelsiusKafkaDecoder))
-            .to[F32]({(): Multiply => Multiply})
-            .to[F32]({(): Add => Add})
-            .to_sink(KafkaSinkConfig[F32](FahrenheitEncoder,
-              KafkaSinkConfigCLIParser(env.args, env.out), env.root as AmbientAuth))
+      let pipeline = recover val
+        let inputs = Wallaroo.source[F32]("Celsius Conversion",
+          KafkaSourceConfig[F32]("Celsius Conversion",
+            ksource_clip.parse_options(env.args)?,
+            env.root as AmbientAuth, CelsiusKafkaDecoder))
+
+        inputs
+          .to[F32](Multiply)
+          .to[F32](Add)
+          .to_sink(KafkaSinkConfig[F32](FahrenheitEncoder,
+            ksink_clip.parse_options(env.args)?,
+            env.root as AmbientAuth))
       end
-      Startup(env, application, "celsius-conversion")
+      Wallaroo.build_application(env, "Celsius Conversion", pipeline)
     else
       @printf[I32]("Couldn't build topology\n".cstring())
     end
 
-primitive Multiply is Computation[F32, F32]
+primitive Multiply is StatelessComputation[F32, F32]
   fun apply(input: F32): F32 =>
     input * 1.8
 
   fun name(): String => "Multiply by 1.8"
 
-primitive Add is Computation[F32, F32]
+primitive Add is StatelessComputation[F32, F32]
   fun apply(input: F32): F32 =>
     input + 32
 
   fun name(): String => "Add 32"
 
 primitive FahrenheitEncoder
-  fun apply(f: F32, wb: Writer): (Array[ByteSeq] val, None) =>
+  fun apply(f: F32, wb: Writer): (Array[ByteSeq] val, None, None) =>
     wb.f32_be(f)
-    (wb.done(), None)
+    (wb.done(), None, None)
 
 primitive CelsiusKafkaDecoder is SourceHandler[F32]
   fun decode(a: Array[U8] val): F32 ? =>
     let r = Reader
     r.append(a)
-    r.f32_be()
+    r.f32_be()?

@@ -12,6 +12,11 @@
 #  implied. See the License for the specific language governing
 #  permissions and limitations under the License.
 
+"""
+This is an example of a stateless Python application that takes a floating
+point Celsius value from Kafka and sends out a floating point Fahrenheit value
+to Kafka.
+"""
 
 import struct
 
@@ -19,51 +24,35 @@ import wallaroo
 
 
 def application_setup(args):
-    (in_topic, in_brokers,
-     in_log_level) = wallaroo.kafka_parse_source_options(args)
+    values = wallaroo.source("convert",
+                    wallaroo.DefaultKafkaSourceCLIParser(decoder))
 
-    (out_topic, out_brokers, out_log_level, out_max_produce_buffer_ms,
-     out_max_message_size) = wallaroo.kafka_parse_sink_options(args)
-
-    ab = wallaroo.ApplicationBuilder("Celsius to Fahrenheit with Kafka")
-
-    ab.new_pipeline("convert",
-                    wallaroo.KafkaSourceConfig(in_topic, in_brokers, in_log_level,
-                                               Decoder()))
-
-    ab.to(Multiply)
-    ab.to(Add)
-
-    ab.to_sink(wallaroo.KafkaSinkConfig(out_topic, out_brokers, out_log_level,
-                                        out_max_produce_buffer_ms,
-                                        out_max_message_size,
-                                        Encoder()))
-    return ab.build()
+    pipeline = (values
+        .to(multiply)
+        .to(add)
+        .to_sink(wallaroo.DefaultKafkaSinkCLIParser(encoder)))
+    return wallaroo.build_application("Celsius to Fahrenheit with Kafka", pipeline)
 
 
-class Decoder(object):
-    def decode(self, bs):
-        if len(bs) < 4:
-          return 0.0
-        return struct.unpack('>f', bs[:4])[0]
-
-class Multiply(object):
-    def name(self):
-        return "multiply by 1.8"
-
-    def compute(self, data):
-        return data * 1.8
+@wallaroo.decoder(header_length=4, length_fmt=">I")
+def decoder(bs):
+    try:
+      return float(bs.decode("utf-8"))
+    except ValueError as e:
+      return 0.0
 
 
-class Add(object):
-    def name(self):
-        return "add 32"
-
-    def compute(self, data):
-        return data + 32
+@wallaroo.computation(name="multiply by 1.8")
+def multiply(data):
+    return data * 1.8
 
 
-class Encoder(object):
-    def encode(self, data):
-        # data is a float
-        return (struct.pack('>f', data), None)
+@wallaroo.computation(name="add 32")
+def add(data):
+    return data + 32
+
+
+@wallaroo.encoder
+def encoder(data):
+    # data is a float
+    return ("%.6f" % (data), None, None)

@@ -1,58 +1,45 @@
 /*
 
-Copyright (C) 2016-2017, Wallaroo Labs
-Copyright (C) 2016-2017, The Pony Developers
-Copyright (c) 2014-2015, Causality Ltd.
-All rights reserved.
+Copyright 2019 The Wallaroo Authors.
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
 
-1. Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
+     http://www.apache.org/licenses/LICENSE-2.0
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ implied. See the License for the specific language governing
+ permissions and limitations under the License.
 
 */
 
 use "buffered"
 use "collections"
 use "net"
+use "promises"
 use "time"
-use "wallaroo_labs/bytes"
-use "wallaroo_labs/time"
+use "wallaroo/core/barrier"
+use "wallaroo/core/checkpoint"
 use "wallaroo/core/common"
-use "wallaroo/ent/network"
-use "wallaroo/ent/spike"
-use "wallaroo/ent/watermarking"
-use "wallaroo_labs/mort"
+use "wallaroo/core/data_receiver"
 use "wallaroo/core/initialization"
 use "wallaroo/core/invariant"
 use "wallaroo/core/messages"
 use "wallaroo/core/metrics"
+use "wallaroo/core/network"
+use "wallaroo/core/recovery"
 use "wallaroo/core/routing"
+use "wallaroo/core/tcp_actor"
 use "wallaroo/core/topology"
+use "wallaroo_labs/bytes"
+use "wallaroo_labs/logging"
+use "wallaroo_labs/mort"
+use "wallaroo_labs/time"
 
-use @pony_asio_event_create[AsioEventID](owner: AsioEventNotify, fd: U32,
-  flags: U32, nsec: U64, noisy: Bool, auto_resub: Bool)
-use @pony_asio_event_fd[U32](event: AsioEventID)
-use @pony_asio_event_unsubscribe[None](event: AsioEventID)
-use @pony_asio_event_resubscribe_read[None](event: AsioEventID)
-use @pony_asio_event_resubscribe_write[None](event: AsioEventID)
-use @pony_asio_event_destroy[None](event: AsioEventID)
-
+use @l[I32](severity: LogSeverity, category: LogCategory, fmt: Pointer[U8] tag,...)
 
 class val OutgoingBoundaryBuilder
   let _auth: AmbientAuth
@@ -60,35 +47,44 @@ class val OutgoingBoundaryBuilder
   let _reporter: MetricsReporter val
   let _host: String
   let _service: String
-  let _spike_config: (SpikeConfig | None)
+  let _tcp_handler_builder: TestableTCPHandlerBuilder
 
-  new val create(auth: AmbientAuth, name: String, r: MetricsReporter iso,
-    h: String, s: String, spike_config: (SpikeConfig | None) = None)
+  new val create(auth: AmbientAuth, worker_name: String,
+    reporter: MetricsReporter iso, host: String, service: String,
+    tcp_handler_builder: TestableTCPHandlerBuilder)
   =>
     _auth = auth
-    _worker_name = name
-    _reporter = consume r
-    _host = h
-    _service = s
-    _spike_config = spike_config
+    _worker_name = worker_name
+    _reporter = consume reporter
+    _host = host
+    _service = service
+    _tcp_handler_builder = tcp_handler_builder
 
-  fun apply(step_id: StepId): OutgoingBoundary =>
-    let boundary = OutgoingBoundary(_auth, _worker_name, _reporter.clone(),
-      _host, _service where spike_config = _spike_config)
-    boundary.register_step_id(step_id)
+  fun apply(routing_id: RoutingId, target_worker: String): OutgoingBoundary =>
+    let boundary = OutgoingBoundary(_auth, _worker_name, target_worker,
+      _tcp_handler_builder, _reporter.clone(), _host, _service)
+    boundary.register_routing_id(routing_id)
+    boundary
 
-  fun build_and_initialize(step_id: StepId,
+  fun build_and_initialize(routing_id: RoutingId, target_worker: String,
     layout_initializer: LayoutInitializer): OutgoingBoundary
   =>
     """
     Called when creating a boundary post cluster initialization
     """
-    let boundary = OutgoingBoundary(_auth, _worker_name, _reporter.clone(),
-      _host, _service where spike_config = _spike_config)
-    boundary.register_step_id(step_id)
+    let boundary = OutgoingBoundary(_auth, _worker_name, target_worker,
+      _tcp_handler_builder, _reporter.clone(), _host, _service)
+    boundary.register_routing_id(routing_id)
     boundary.quick_initialize(layout_initializer)
+    boundary
 
-actor OutgoingBoundary is Consumer
+  fun val clone_with_new_service(host: String, service: String):
+    OutgoingBoundaryBuilder val
+  =>
+    OutgoingBoundaryBuilder(_auth, _worker_name, _reporter.clone(),
+      host, service, _tcp_handler_builder)
+
+actor OutgoingBoundary is (Consumer & TCPActor)
   // Steplike
   let _wb: Writer = Writer
   let _metrics_reporter: MetricsReporter
@@ -96,87 +92,76 @@ actor OutgoingBoundary is Consumer
   // Lifecycle
   var _initializer: (LayoutInitializer | None) = None
   var _reported_initialized: Bool = false
+  var _reported_ready_to_work: Bool = false
+  var _ready_to_work_requested: Bool = false
 
   // Consumer
+  var _registered_producers: RegisteredProducers =
+    _registered_producers.create()
   var _upstreams: SetIs[Producer] = _upstreams.create()
-  var _mute_outstanding: Bool = false
 
-  // TCP
-  var _notify: WallarooOutgoingNetworkActorNotify
-  var _read_buf: Array[U8] iso
-  var _next_size: USize
-  let _max_size: USize
-  var _connect_count: U32 = 0
-  var _fd: U32 = -1
-  var _in_sent: Bool = false
-  var _expect: USize = 0
-  var _connected: Bool = false
-  var _closed: Bool = false
-  var _writeable: Bool = false
-  var _throttled: Bool = false
-  var _event: AsioEventID = AsioEvent.none()
-  embed _pending: List[(ByteSeq, USize)] = _pending.create()
-  embed _pending_writev: Array[USize] = _pending_writev.create()
-  var _pending_writev_total: USize = 0
-  var _shutdown_peer: Bool = false
-  var _readable: Bool = false
-  var _read_len: USize = 0
-  var _shutdown: Bool = false
-  var _muted: Bool = false
-  var _no_more_reconnect: Bool = false
-  var _expect_read_buf: Reader = Reader
+  var _mute_outstanding: Bool = false
 
   // Connection, Acking and Replay
   var _connection_initialized: Bool = false
   var _replaying: Bool = false
   let _auth: AmbientAuth
-  let _worker_name: String
-  var _step_id: StepId = 0
-  let _host: String
-  let _service: String
-  let _from: String
+  let _worker_name: WorkerName
+  let _target_worker: WorkerName
+  var _routing_id: RoutingId = 0
+  var _host: String
+  var _service: String
+  // Queuing all messages in case we need to resend them
   let _queue: Array[Array[ByteSeq] val] = _queue.create()
+  // Queuing messages we haven't sent yet (these will also be queued in _queue,
+  // so _unsent is a subset of _queue).
+  let _unsent: Array[Array[ByteSeq] val] = _unsent.create()
   var _lowest_queue_id: SeqId = 0
   // TODO: this should go away and TerminusRoute entirely takes
   // over seq_id generation whether there is resilience or not.
-  var _seq_id: SeqId = 1
+  var seq_id: SeqId = 0
+  var _disposed: Bool = false
 
-  // Producer (Resilience)
-  let _terminus_route: TerminusRoute = TerminusRoute
-
-  var _reconnect_pause: U64 = 10_000_000_000
+  // Reconnect
+  var _initial_reconnect_pause: U64 = 500_000_000
+  var _reconnect_pause: U64 = _initial_reconnect_pause
   let _timers: Timers = Timers
 
-  new create(auth: AmbientAuth, worker_name: String,
+  var _pending_immediate_ack_promise:
+    (Promise[OutgoingBoundary] | None) = None
+
+  // TCP
+  var _tcp_handler: TestableTCPHandler = EmptyTCPHandler
+
+  var _header: Bool = true
+  let _reconnect_closed_delay: U64
+  let _reconnect_failed_delay: U64
+  var _initial_connection_was_established: Bool = false
+
+  var _connection_round: ConnectionRound = 0
+
+  new create(auth: AmbientAuth, worker_name: String, target_worker: String,
+    tcp_handler_builder: TestableTCPHandlerBuilder,
     metrics_reporter: MetricsReporter iso, host: String, service: String,
-    from: String = "", init_size: USize = 64, max_size: USize = 16384,
-    spike_config:(SpikeConfig | None) = None)
+    reconnect_closed_delay: U64 = 100_000_000,
+    reconnect_failed_delay: U64 = 10_000_000_000)
   =>
     """
     Connect via IPv4 or IPv6. If `from` is a non-empty string, the connection
     will be made from the specified interface.
     """
     _auth = auth
-    ifdef "spike" then
-      match spike_config
-      | let sc: SpikeConfig =>
-        var notify = recover iso BoundaryNotify(_auth, this) end
-        _notify = SpikeWrapper(consume notify, sc)
-      else
-        _notify = BoundaryNotify(_auth, this)
-      end
-    else
-      _notify = BoundaryNotify(_auth, this)
-    end
-
     _worker_name = worker_name
+    _target_worker = target_worker
     _host = host
     _service = service
-    _from = from
     _metrics_reporter = consume metrics_reporter
-    _read_buf = recover Array[U8].undefined(init_size) end
-    _next_size = init_size
-    _max_size = 65_536
+    _reconnect_closed_delay = reconnect_closed_delay
+    _reconnect_failed_delay = reconnect_failed_delay
+    _tcp_handler = tcp_handler_builder(this)
+
+  fun ref tcp_handler(): TestableTCPHandler =>
+    _tcp_handler
 
   //
   // Application startup lifecycle event
@@ -186,79 +171,103 @@ actor OutgoingBoundary is Consumer
     _initializer = initializer
     initializer.report_created(this)
 
-  be application_created(initializer: LocalTopologyInitializer,
-    omni_router: OmniRouter)
-  =>
-    _connect_count = @pony_os_connect_tcp[U32](this,
-      _host.cstring(), _service.cstring(),
-      _from.cstring())
-    _notify_connecting()
-
+  be application_created(initializer: LocalTopologyInitializer) =>
+    _tcp_handler.connect(_host, _service)
     @printf[I32](("Connecting OutgoingBoundary to " + _host + ":" + _service +
       "\n").cstring())
 
   be application_initialized(initializer: LocalTopologyInitializer) =>
     try
-      if _step_id == 0 then
+      if _routing_id == 0 then
         Fail()
       end
-
-      let connect_msg = ChannelMsgEncoder.data_connect(_worker_name, _step_id,
-        _auth)
-      _writev(connect_msg)
+      _ready_to_work_requested = true
+      if not _reported_ready_to_work and _connection_initialized then
+        _report_ready_to_work()
+      end
+      let connect_msg = ChannelMsgEncoder.data_connect(_worker_name,
+        _routing_id, seq_id, _connection_round, _auth)?
+      _tcp_handler.writev(connect_msg)
     else
       Fail()
     end
 
-    initializer.report_ready_to_work(this)
-
   be application_ready_to_work(initializer: LocalTopologyInitializer) =>
+    None
+
+  be cluster_ready_to_work(initializer: LocalTopologyInitializer) =>
     None
 
   be quick_initialize(initializer: LayoutInitializer) =>
     """
     Called when initializing as part of a new worker joining a running cluster.
     """
-    try
-      _initializer = initializer
-      _reported_initialized = true
-      _connect_count = @pony_os_connect_tcp[U32](this,
-        _host.cstring(), _service.cstring(),
-        _from.cstring())
-      _notify_connecting()
+    if not _reported_initialized then
+      try
+        _initializer = initializer
+        _reported_initialized = true
+        _reported_ready_to_work = true
+        _tcp_handler.connect(_host, _service)
 
-      @printf[I32](("Connecting OutgoingBoundary to " + _host + ":" +
-        _service + "\n").cstring())
+        @printf[I32](("Connecting OutgoingBoundary to " + _host + ":" +
+          _service + "\n").cstring())
 
-      if _step_id == 0 then
+        if _routing_id == 0 then
+          Fail()
+        end
+
+        let connect_msg = ChannelMsgEncoder.data_connect(_worker_name,
+          _routing_id, seq_id, _connection_round, _auth)?
+        _tcp_handler.writev(connect_msg)
+      else
         Fail()
       end
+    end
 
-      let connect_msg = ChannelMsgEncoder.data_connect(_worker_name, _step_id,
-        _auth)
-      _writev(connect_msg)
+  be ack_immediately(p: Promise[OutgoingBoundary]) =>
+    _pending_immediate_ack_promise = p
+    try
+      let msg = ChannelMsgEncoder.data_receiver_ack_immediately(
+        _connection_round, _routing_id, _auth)?
+
+      if _connection_initialized then
+        _tcp_handler.writev(msg)
+      else
+        _unsent.push(msg)
+      end
     else
       Fail()
     end
 
-  be reconnect() =>
-    if not _connected and not _no_more_reconnect then
-      _connect_count = @pony_os_connect_tcp[U32](this,
-        _host.cstring(), _service.cstring(),
-        _from.cstring())
-      _notify_connecting()
+  fun ref receive_immediate_ack() =>
+    match _pending_immediate_ack_promise
+    | let p: Promise[OutgoingBoundary] => p(this)
+    else
+      @printf[I32](("OutgoingBoundary: Received immediate ack but " +
+        "had no corresponding pending promise.\n").cstring())
     end
 
-    @printf[I32](("RE-Connecting OutgoingBoundary to " + _host + ":" + _service
-      + "\n").cstring())
+  be reconnect() =>
+    _reconnect()
 
-  be migrate_step[K: (Hashable val & Equatable[K] val)](step_id: StepId,
-    state_name: String, key: K, state: ByteSeq val)
+  fun ref _reconnect() =>
+    if not _tcp_handler.is_connected() then
+      @printf[I32](("RE-Connecting OutgoingBoundary to " + _host + ":" +
+        _service + "\n").cstring())
+
+      // set replaying to true since we might need to replay to
+      // downstream before resuming
+      _replaying = true
+      _tcp_handler.connect(_host, _service)
+    end
+
+  be migrate_key(routing_id: RoutingId, step_group: RoutingId, key: Key,
+    checkpoint_id: CheckpointId, state: ByteSeq val)
   =>
     try
-      let outgoing_msg = ChannelMsgEncoder.migrate_step[K](step_id,
-        state_name, key, state, _worker_name, _auth)
-      _writev(outgoing_msg)
+      let outgoing_msg = ChannelMsgEncoder.migrate_key(step_group, key,
+        checkpoint_id, state, _worker_name, _connection_round, _auth)?
+      _tcp_handler.writev(outgoing_msg)
     else
       Fail()
     end
@@ -266,35 +275,42 @@ actor OutgoingBoundary is Consumer
   be send_migration_batch_complete() =>
     try
       let migration_batch_complete_msg =
-        ChannelMsgEncoder.migration_batch_complete(_worker_name, _auth)
-      _writev(migration_batch_complete_msg)
+        ChannelMsgEncoder.migration_batch_complete(_worker_name,
+          _connection_round, _auth)?
+      _tcp_handler.writev(migration_batch_complete_msg)
     else
       Fail()
     end
 
-  be register_step_id(step_id: StepId) =>
-    _step_id = step_id
+  be register_routing_id(routing_id: RoutingId) =>
+    _routing_id = routing_id
+
+    ifdef "identify_routing_ids" then
+      @printf[I32]("===OutgoingBoundary %s to target worker %s routing_id registered===\n"
+        .cstring(), _routing_id.string().cstring(), _target_worker.cstring())
+    end
 
   be run[D: Any val](metric_name: String, pipeline_time_spent: U64, data: D,
-    producer: Producer, msg_uid: MsgId, frac_ids: FractionalMessageId,
-    seq_id: SeqId, route_id: RouteId,
-    latest_ts: U64, metrics_id: U16, worker_ingress_ts: U64)
+    key: Key, event_ts: U64, watermark_ts: U64, i_producer_id: RoutingId,
+    i_producer: Producer, msg_uid: MsgId, frac_ids: FractionalMessageId,
+    i_seq_id: SeqId, latest_ts: U64, metrics_id: U16, worker_ingress_ts: U64)
   =>
-    // Run should never be called on an OutgoingBoundary
+    // run() should never be called on an OutgoingBoundary
     Fail()
 
-  be replay_run[D: Any val](metric_name: String, pipeline_time_spent: U64,
-    data: D, producer: Producer, msg_uid: MsgId, frac_ids: FractionalMessageId,
-    incoming_seq_id: SeqId, route_id: RouteId,
+  fun ref process_message[D: Any val](metric_name: String,
+    pipeline_time_spent: U64, data: D, key: Key, event_ts: U64,
+    watermark_ts: U64, i_producer_id: RoutingId, i_producer: Producer,
+    msg_uid: MsgId, frac_ids: FractionalMessageId, i_seq_id: SeqId,
     latest_ts: U64, metrics_id: U16, worker_ingress_ts: U64)
   =>
-    // Should never be called on an OutgoingBoundary
+    // process_message() should never be called on an OutgoingBoundary
     Fail()
 
   // TODO: open question: how do we reconnect if our external system goes away?
-  be forward(delivery_msg: ReplayableDeliveryMsg, pipeline_time_spent: U64,
-    i_producer: Producer, i_seq_id: SeqId, i_route_id: RouteId, latest_ts: U64,
-    metrics_id: U16, worker_ingress_ts: U64)
+  be forward(delivery_msg: DeliveryMsg, pipeline_time_spent: U64,
+    i_producer_id: RoutingId, i_producer: Producer, i_seq_id: SeqId,
+    latest_ts: U64, metrics_id: U16, worker_ingress_ts: U64)
   =>
     let metric_name = delivery_msg.metric_name()
     // TODO: delete
@@ -305,7 +321,7 @@ actor OutgoingBoundary is Consumer
     end
 
     let my_latest_ts = ifdef "detailed-metrics" then
-        Time.nanos()
+        WallClock.nanoseconds()
       else
         latest_ts
       end
@@ -319,23 +335,22 @@ actor OutgoingBoundary is Consumer
       end
 
     try
-      let seq_id = ifdef "resilience" then
-        _terminus_route.terminate(i_producer, i_route_id, i_seq_id)
-      else
-        _seq_id = _seq_id + 1
-      end
+      seq_id = seq_id + 1
 
       let outgoing_msg = ChannelMsgEncoder.data_channel(delivery_msg,
-        pipeline_time_spent + (Time.nanos() - worker_ingress_ts),
+        i_producer_id,
+        pipeline_time_spent + (WallClock.nanoseconds() - worker_ingress_ts),
         seq_id, _wb, _auth, WallClock.nanoseconds(),
-        new_metrics_id, metric_name)
+        new_metrics_id, metric_name, _connection_round)?
       _add_to_upstream_backup(outgoing_msg)
 
       if _connection_initialized then
-        _writev(outgoing_msg)
+        _tcp_handler.writev(outgoing_msg)
+      else
+        _unsent.push(outgoing_msg)
       end
 
-      let end_ts = Time.nanos()
+      let end_ts = WallClock.nanoseconds()
 
       ifdef "detailed-metrics" then
         _metrics_reporter.step_metric(metric_name,
@@ -350,50 +365,65 @@ actor OutgoingBoundary is Consumer
 
     _maybe_mute_or_unmute_upstreams()
 
-  be writev(data: Array[ByteSeq] val) =>
-    _writev(data)
-
-  be receive_state(state: ByteSeq val) => Fail()
-
-  fun ref receive_ack(seq_id: SeqId) =>
-    ifdef debug then
-      Invariant(seq_id > _lowest_queue_id)
+  fun ref receive_ack(acked_seq_id: SeqId) =>
+    if not (acked_seq_id > _lowest_queue_id) then
+      // This is probably because of an outdated message.
+      // TODO: We need to be careful that this isn't masking a potential bug.
+      @l(Log.debug(), Log.boundary(), "Ignoring acked seq id %lu from worker %s, which is less than _lowest_queue_id %lu. Current seq_id is %lu\n"
+        .cstring(), acked_seq_id, _worker_name.cstring(), _lowest_queue_id,
+        seq_id)
+      Invariant(not (acked_seq_id > seq_id))
+      return
     end
+
+    @l(Log.debug(), Log.boundary(), "worker %s target_worker %s acked_seq_id %lu > _lowest_queue_id %lu. Current seq_id is %lu\n".cstring(), _worker_name.cstring(), _target_worker.cstring(), acked_seq_id, _lowest_queue_id, seq_id)
 
     ifdef "trace" then
       @printf[I32](
         "OutgoingBoundary: got ack from downstream worker\n".cstring())
     end
 
-    let flush_count: USize = (seq_id - _lowest_queue_id).usize()
+    let flush_count: USize = (acked_seq_id - _lowest_queue_id).usize()
     _queue.remove(0, flush_count)
     _maybe_mute_or_unmute_upstreams()
     _lowest_queue_id = _lowest_queue_id + flush_count.u64()
 
-    ifdef "resilience" then
-      _terminus_route.receive_ack(seq_id)
+  fun ref start_normal_sending(last_id_seen: SeqId,
+    connection_round: ConnectionRound)
+  =>
+    _connection_round = connection_round
+    if not _reported_ready_to_work and _ready_to_work_requested then
+      _report_ready_to_work()
     end
-
-  fun ref receive_connect_ack(last_id_seen: SeqId) =>
-    _replay_from(last_id_seen)
-
-  fun ref start_normal_sending() =>
     _connection_initialized = true
     _replaying = false
+    for msg in _unsent.values() do
+      _tcp_handler.writev(msg)
+    end
+    _unsent.clear()
+    _replay_from(last_id_seen)
     _maybe_mute_or_unmute_upstreams()
 
-  fun ref _replay_from(idx: SeqId) =>
-    try
-      var cur_id = _lowest_queue_id
-      for msg in _queue.values() do
-        if cur_id >= idx then
-          _writev(ChannelMsgEncoder.replay(msg, _auth))
-        end
-        cur_id = cur_id + 1
-      end
-      _writev(ChannelMsgEncoder.replay_complete(_worker_name, _step_id, _auth))
+  fun ref _report_ready_to_work() =>
+    match _initializer
+    | let li: LayoutInitializer =>
+      li.report_ready_to_work(this)
+      _reported_ready_to_work = true
     else
       Fail()
+    end
+
+  fun ref _replay_from(idx: SeqId) =>
+    // In case the downstream has failed and recovered, resend producer
+    // registrations.
+    resend_producer_registrations()
+
+    var cur_id = _lowest_queue_id
+    for msg in _queue.values() do
+      if cur_id >= idx then
+        _tcp_handler.writev(msg)
+      end
+      cur_id = cur_id + 1
     end
 
   be update_router(router: Router) =>
@@ -409,499 +439,173 @@ actor OutgoingBoundary is Consumer
     silently discarded and not acknowleged.
     """
     @printf[I32]("Shutting down OutgoingBoundary\n".cstring())
-    _no_more_reconnect = true
+    _unmute_upstreams()
     _timers.dispose()
-    close()
-    _notify.dispose()
+    _tcp_handler.close()
+    _disposed = true
 
   be request_ack() =>
     // TODO: How do we propagate this down?
     None
 
-  be register_producer(producer: Producer) =>
+  be register_producer(id: RoutingId, producer: Producer) =>
     ifdef debug then
       Invariant(not _upstreams.contains(producer))
     end
 
     _upstreams.set(producer)
 
-  be unregister_producer(producer: Producer) =>
-    ifdef debug then
-      Invariant(_upstreams.contains(producer))
-    end
+  be unregister_producer(id: RoutingId, producer: Producer) =>
+    // TODO: Determine if we need this Invariant.
+    // ifdef debug then
+    //   Invariant(_upstreams.contains(producer))
+    // end
 
     _upstreams.unset(producer)
 
-  //
-  // TCP
-  be _event_notify(event: AsioEventID, flags: U32, arg: U32) =>
-    """
-    Handle socket events.
-    """
-    if event isnt _event then
-      if AsioEvent.writeable(flags) then
-        // A connection has completed.
-        var fd = @pony_asio_event_fd(event)
-        _connect_count = _connect_count - 1
+  be forward_register_producer(source_id: RoutingId, target_id: RoutingId,
+    producer: Producer)
+  =>
+    _forward_register_producer(source_id, target_id, producer)
 
-        if not _connected and not _closed then
-          // We don't have a connection yet.
-          if @pony_os_connected[Bool](fd) then
-            // The connection was successful, make it ours.
-            _fd = fd
-            _event = event
-            _connected = true
-            _writeable = true
-
-            _notify.connected(this)
-            _on_connected()
-
-            ifdef not windows then
-              if _pending_writes() then
-                //sent all data; release backpressure
-                _release_backpressure()
-              end
-            end
-          else
-            // The connection failed, unsubscribe the event and close.
-            @pony_asio_event_unsubscribe(event)
-            @pony_os_socket_close[None](fd)
-            _notify_connecting()
-          end
-        elseif not _connected and _closed then
-          @printf[I32]("Reconnection asio event\n".cstring())
-          if @pony_os_connected[Bool](fd) then
-            // The connection was successful, make it ours.
-            _fd = fd
-            _event = event
-
-            // clear anything pending to be sent because on recovery we're
-            // going to have to replay from our queue when requested
-            _pending_writev.clear()
-            _pending.clear()
-            _pending_writev_total = 0
-
-            _connected = true
-            _writeable = true
-
-            // set replaying to true since we might need to replay to
-            // downstream before resuming
-            _replaying = true
-
-            _closed = false
-            _shutdown = false
-            _shutdown_peer = false
-
-            _notify.connected(this)
-
-            try
-              let connect_msg = ChannelMsgEncoder.data_connect(_worker_name,
-                _step_id, _auth)
-              _writev(connect_msg)
-            else
-              @printf[I32]("error creating data connect message on reconnect\n"
-                .cstring())
-            end
-
-            ifdef not windows then
-              if _pending_writes() then
-                //sent all data; release backpressure
-                _release_backpressure()
-              end
-            end
-            _maybe_mute_or_unmute_upstreams()
-          else
-            // The connection failed, unsubscribe the event and close.
-            @pony_asio_event_unsubscribe(event)
-            @pony_os_socket_close[None](fd)
-            _notify_connecting()
-          end
-        else
-          // We're already connected, unsubscribe the event and close.
-          @pony_asio_event_unsubscribe(event)
-          @pony_os_socket_close[None](fd)
-        end
-      else
-        // It's not our event.
-        if AsioEvent.disposable(flags) then
-          // It's disposable, so dispose of it.
-          @pony_asio_event_destroy(event)
-        end
-      end
-    else
-      // At this point, it's our event.
-      if _connected and not _shutdown_peer then
-        if AsioEvent.writeable(flags) then
-          _writeable = true
-          ifdef not windows then
-            if _pending_writes() then
-              //sent all data; release backpressure
-              _release_backpressure()
-            end
-          end
-        end
-
-        if AsioEvent.readable(flags) then
-          _readable = true
-          _pending_reads()
-        end
-      end
-
-      if AsioEvent.disposable(flags) then
-        @pony_asio_event_destroy(event)
-        _event = AsioEvent.none()
-      end
-
-      _try_shutdown()
-    end
-
-  fun ref _on_connected() =>
-    if not _reported_initialized then
-      // If connecting failed, we should handle here
-      match _initializer
-      | let lti: LocalTopologyInitializer =>
-        lti.report_initialized(this)
-        _reported_initialized = true
-      else
-        Fail()
-      end
-    end
-
-  fun ref _schedule_reconnect() =>
-    if (_host != "") and (_service != "") and not _no_more_reconnect then
-      @printf[I32]("RE-Connecting OutgoingBoundary to %s:%s\n".cstring(),
-        _host.cstring(), _service.cstring())
-      let timer = Timer(_PauseBeforeReconnect(this), _reconnect_pause)
-      _timers(consume timer)
-    end
-
-  fun ref _writev(data: ByteSeqIter) =>
-    """
-    Write a sequence of sequences of bytes.
-    """
-    _in_sent = true
-
-    var data_size: USize = 0
-    for bytes in _notify.sentv(this, data).values() do
-      _pending_writev.push(bytes.cpointer().usize()).push(bytes.size())
-      _pending_writev_total = _pending_writev_total + bytes.size()
-      _pending.push((bytes, 0))
-      data_size = data_size + bytes.size()
-    end
-
-    _pending_writes()
-
-    _in_sent = false
-
-  fun ref _write_final(data: ByteSeq) =>
-    """
-    Write as much as possible to the socket. Set _writeable to false if not
-    everything was written. On an error, close the connection. This is for
-    data that has already been transformed by the notifier.
-    """
-    _pending_writev.push(data.cpointer().usize()).push(data.size())
-    _pending_writev_total = _pending_writev_total + data.size()
-
-    _pending.push((data, 0))
-    _pending_writes()
-
-  fun ref _notify_connecting() =>
-    """
-    Inform the notifier that we're connecting.
-    """
-    if _connect_count > 0 then
-      _notify.connecting(this, _connect_count)
-    else
-      _notify.connect_failed(this)
-      _hard_close()
-      _schedule_reconnect()
-    end
-
-  fun ref close() =>
-    """
-    Perform a graceful shutdown. Don't accept new writes, but don't finish
-    closing until we get a zero length read.
-    """
-    _closed = true
-    _try_shutdown()
-
-  fun ref _try_shutdown() =>
-    """
-    If we have closed and we have no remaining writes or pending connections,
-    then shutdown.
-    """
-    if not _closed then
-      return
-    end
-
-    if
-      not _shutdown and
-      (_connect_count == 0) and
-      (_pending_writev_total == 0)
-    then
-      _shutdown = true
-
-      if _connected then
-        @pony_os_socket_shutdown[None](_fd)
-      else
-        _shutdown_peer = true
-      end
-    end
-
-    if _connected and _shutdown and _shutdown_peer then
-      _hard_close()
-    end
-
-  fun ref _hard_close() =>
-    """
-    When an error happens, do a non-graceful close.
-    """
-    if not _connected then
-      return
-    end
-
-    _connected = false
-    _closed = true
-    _shutdown = true
-    _shutdown_peer = true
-
-    // Unsubscribe immediately and drop all pending writes.
-    @pony_asio_event_unsubscribe(_event)
-    _pending_writev.clear()
-    _pending.clear()
-    _pending_writev_total = 0
-    _readable = false
-    _writeable = false
-    ifdef linux then
-      AsioEvent.set_readable(_event, false)
-      AsioEvent.set_writeable(_event, false)
-    end
-
-    @pony_os_socket_close[None](_fd)
-    _fd = -1
-
-    _notify.closed(this)
-    _connection_initialized = false
-
-  fun ref _pending_reads() =>
-    """
-    Unless this connection is currently muted, read while data is available,
-    guessing the next packet length as we go. If we read 4 kb of data, send
-    ourself a resume message and stop reading, to avoid starving other actors.
-    """
+  fun ref _forward_register_producer(source_id: RoutingId,
+    target_id: RoutingId, producer: Producer)
+  =>
+    _registered_producers.register_producer(source_id, producer, target_id)
     try
-      var sum: USize = 0
-      var received_called: USize = 0
-
-      while _readable and not _shutdown_peer do
-        if _muted then
-          return
-        end
-
-        // Read as much data as possible.
-        let len = @pony_os_recv[USize](
-          _event,
-          _read_buf.cpointer().usize() + _read_len,
-          _read_buf.size() - _read_len) ?
-
-        match len
-        | 0 =>
-          // Would block, try again later.
-          ifdef linux then
-            // this is safe because asio thread isn't currently subscribed
-            // for a read event so will not be writing to the readable flag
-            AsioEvent.set_readable(_event, false)
-            _readable = false
-            @pony_asio_event_resubscribe_read(_event)
-          else
-            _readable = false
-          end
-          return
-        | _next_size =>
-          // Increase the read buffer size.
-          _next_size = _max_size.min(_next_size * 2)
-        end
-
-        _read_len = _read_len + len
-
-        if _read_len >= _expect then
-          let data = _read_buf = recover Array[U8] end
-          data.truncate(_read_len)
-          _read_len = 0
-
-          received_called = received_called + 1
-          if not _notify.received(this, consume data,
-            received_called)
-          then
-            _read_buf_size()
-            _read_again()
-            return
-          else
-            _read_buf_size()
-          end
-
-          sum = sum + len
-
-          if sum >= _max_size then
-            // If we've read _max_size, yield and read again later.
-            _read_again()
-            return
-          end
-        end
-      end
-    else
-      // The socket has been closed from the other side.
-      _shutdown_peer = true
-      _hard_close()
-      _schedule_reconnect()
-    end
-
-  be _read_again() =>
-    """
-    Resume reading.
-    """
-    _pending_reads()
-
-  fun ref _pending_writes(): Bool =>
-    """
-    Send pending data. If any data can't be sent, keep it and mark as not
-    writeable. On an error, dispose of the connection. Returns whether
-    it sent all pending data or not.
-    """
-    // TODO: Make writev_batch_size user configurable
-    let writev_batch_size: USize = @pony_os_writev_max[I32]().usize()
-    var num_to_send: USize = 0
-    var bytes_to_send: USize = 0
-    var bytes_sent: USize = 0
-    while _writeable and not _shutdown_peer and (_pending_writev_total > 0) do
-      try
-        //determine number of bytes and buffers to send
-        if (_pending_writev.size()/2) < writev_batch_size then
-          num_to_send = _pending_writev.size()/2
-          bytes_to_send = _pending_writev_total
-        else
-          //have more buffers than a single writev can handle
-          //iterate over buffers being sent to add up total
-          num_to_send = writev_batch_size
-          bytes_to_send = 0
-          for d in Range[USize](1, num_to_send*2, 2) do
-            bytes_to_send = bytes_to_send + _pending_writev(d)
-          end
-        end
-
-        // Write as much data as possible.
-        var len = @pony_os_writev[USize](_event,
-          _pending_writev.cpointer(), num_to_send) ?
-
-        // keep track of how many bytes we sent
-        bytes_sent = bytes_sent + len
-
-        if len < bytes_to_send then
-          while len > 0 do
-            let iov_p = _pending_writev(0)
-            let iov_s = _pending_writev(1)
-            if iov_s <= len then
-              len = len - iov_s
-              _pending_writev.shift()
-              _pending_writev.shift()
-              _pending.shift()
-              _pending_writev_total = _pending_writev_total - iov_s
-            else
-              _pending_writev.update(0, iov_p+len)
-              _pending_writev.update(1, iov_s-len)
-              _pending_writev_total = _pending_writev_total - len
-              len = 0
-            end
-          end
-          _apply_backpressure()
-        else
-          // sent all data we requested in this batch
-          _pending_writev_total = _pending_writev_total - bytes_to_send
-          if _pending_writev_total == 0 then
-            _pending_writev.clear()
-            _pending.clear()
-
-            return true
-          else
-            for d in Range[USize](0, num_to_send, 1) do
-              _pending_writev.shift()
-              _pending_writev.shift()
-              _pending.shift()
-            end
-          end
-        end
+      let msg = ChannelMsgEncoder.register_producer(_worker_name,
+        source_id, target_id, _connection_round, _auth)?
+      if _connection_initialized then
+        _tcp_handler.writev(msg)
       else
-        // Non-graceful shutdown on error.
-        _hard_close()
-        _schedule_reconnect()
+        _unsent.push(msg)
       end
-    end
-
-    false
-
-  fun ref _read_buf_size() =>
-    """
-    Resize the read buffer.
-    """
-    if _expect != 0 then
-      _read_buf.undefined(_expect)
     else
-      _read_buf.undefined(_next_size)
+      Fail()
+    end
+    _upstreams.set(producer)
+
+  be forward_unregister_producer(source_id: RoutingId, target_id: RoutingId,
+    producer: Producer)
+  =>
+    _registered_producers.unregister_producer(source_id, producer, target_id)
+    try
+      let msg = ChannelMsgEncoder.unregister_producer(_worker_name,
+        source_id, target_id, _connection_round, _auth)?
+      if _connection_initialized then
+        _tcp_handler.writev(msg)
+      else
+        _unsent.push(msg)
+      end
+    else
+      Fail()
+    end
+    _upstreams.unset(producer)
+
+  fun ref resend_producer_registrations() =>
+    for (producer_id, producer, target_id) in
+      _registered_producers.registrations().values()
+    do
+      _forward_register_producer(producer_id, target_id, producer)
     end
 
-  fun ref expect(qty: USize = 0) =>
-    """
-    A `received` call on the notifier must contain exactly `qty` bytes. If
-    `qty` is zero, the call can contain any amount of data. This has no effect
-    if called in the `sent` notifier callback.
-    """
-    if not _in_sent then
-      _expect = _notify.expect(this, qty)
-      _read_buf_size()
+  be report_status(code: ReportStatusCode) =>
+    try
+      _tcp_handler.writev(ChannelMsgEncoder.report_status(code, _auth)?)
+    else
+      Fail()
     end
 
-  fun local_address(): IPAddress =>
-    """
-    Return the local IP address.
-    """
-    let ip = recover IPAddress end
-    @pony_os_sockname[Bool](_fd, ip)
-    ip
-
-  fun ref set_nodelay(state: Bool) =>
-    """
-    Turn Nagle on/off. Defaults to on. This can only be set on a connected
-    socket.
-    """
-    if _connected then
-      @pony_os_nodelay[None](_fd, state)
+  //////////////
+  // BARRIER
+  //////////////
+  be forward_barrier(target_routing_id: RoutingId,
+    origin_routing_id: RoutingId, barrier_token: BarrierToken)
+  =>
+    match barrier_token
+    | let srt: CheckpointRollbackBarrierToken =>
+      _queue.clear()
+      _unsent.clear()
     end
 
+    try
+      // If our downstream DataReceiver requests we replay messages, we need
+      // to ensure we replay the barrier as well and in the correct place.
+      seq_id = seq_id + 1
+
+      let msg = ChannelMsgEncoder.forward_barrier(target_routing_id,
+        origin_routing_id, barrier_token, seq_id, _connection_round, _auth)?
+      if _connection_initialized then
+        _tcp_handler.writev(msg)
+      else
+        _unsent.push(msg)
+      end
+      _add_to_upstream_backup(msg)
+    else
+      Fail()
+    end
+
+  be receive_barrier(routing_id: RoutingId, producer: Producer,
+    barrier_token: BarrierToken)
+  =>
+    // We only forward barriers at the boundary. The OutgoingBoundary
+    // does not participate directly in the barrier protocol.
+    Fail()
+
+  fun ref barrier_complete(barrier_token: BarrierToken) =>
+    // We only forward barriers at the boundary. The OutgoingBoundary
+    // does not participate directly in the barrier protocol.
+    Fail()
+
+  ///////////////
+  // CHECKPOINTS
+  ///////////////
+  fun ref checkpoint_state(checkpoint_id: CheckpointId) =>
+    """
+    Boundaries don't currently write out any data as part of the checkpoint.
+    """
+    None
+
+  be prepare_for_rollback() =>
+    _lowest_queue_id = _lowest_queue_id + _queue.size().u64()
+    _queue.clear()
+    _unsent.clear()
+    _pending_immediate_ack_promise = None
+
+  be rollback(payload: ByteSeq val, event_log: EventLog,
+    checkpoint_id: CheckpointId)
+  =>
+    // TODO: It's clear that the following line fixes BUG #3056,
+    //       but it is not clear if it may create a problem in
+    //       detecting out-of-order sequence IDs in the future;
+    //       see BUG #3063.
+    _lowest_queue_id = 0
+
+  be update_worker_data_service(worker: WorkerName,
+    host: String, service: String)
+  =>
+    @printf[I32]("OutgoingBoundary: update worker data service: %s -> %s %s\n"
+      .cstring(), worker.cstring(), host.cstring(), service.cstring())
+    if worker != _target_worker then
+      Fail()
+    end
+    _host = host
+    _service = service
+    _reconnect()
+
+  ///////////
+  // QUEUES
+  ///////////
   fun ref _add_to_upstream_backup(msg: Array[ByteSeq] val) =>
     _queue.push(msg)
     _maybe_mute_or_unmute_upstreams()
 
-  fun ref _apply_backpressure() =>
-    if not _throttled then
-      _throttled = true
-      _writeable = false
-      ifdef linux then
-        // this is safe because asio thread isn't currently subscribed
-        // for a write event so will not be writing to the readable flag
-        AsioEvent.set_writeable(_event, false)
-        @pony_asio_event_resubscribe_write(_event)
-      end
-      _notify.throttled(this)
-      _maybe_mute_or_unmute_upstreams()
-    end
+  fun _backup_queue_is_overflowing(): Bool =>
+    _queue.size() >= 16_384
 
-  fun ref _release_backpressure() =>
-    if _throttled then
-      _throttled = false
-      _notify.unthrottled(this)
-      _maybe_mute_or_unmute_upstreams()
-    end
-
+  /////////////////
+  // MUTE/UNMUTE
+  /////////////////
   fun ref _maybe_mute_or_unmute_upstreams() =>
     if _mute_outstanding then
       if _can_send() then
@@ -926,39 +630,51 @@ actor OutgoingBoundary is Consumer
     _mute_outstanding = false
 
   fun _can_send(): Bool =>
-    _connected and
-      _writeable and
-      not _closed and
+    _tcp_handler.can_send() and
       not _replaying and
       not _backup_queue_is_overflowing()
 
-  fun _backup_queue_is_overflowing(): Bool =>
-    _queue.size() >= 16_384
+  fun ref _set_connection_not_initialized() =>
+    _connection_initialized = false
 
-class BoundaryNotify is WallarooOutgoingNetworkActorNotify
-  let _auth: AmbientAuth
-  var _header: Bool = true
-  let _outgoing_boundary: OutgoingBoundary tag
-  let _reconnect_closed_delay: U64
-  let _reconnect_failed_delay: U64
+  fun ref maybe_report_initialized() =>
+    if not _reported_initialized then
+      // If connecting failed, we should handle here
+      match _initializer
+      | let lti: LocalTopologyInitializer =>
+        lti.report_initialized(this)
+        _reported_initialized = true
+      else
+        Fail()
+      end
+    end
 
-  new create(auth: AmbientAuth, outgoing_boundary: OutgoingBoundary tag,
-    reconnect_closed_delay: U64 = 100_000_000,
-    reconnect_failed_delay: U64 = 10_000_000_000)
-    =>
-    _auth = auth
-    _outgoing_boundary = outgoing_boundary
-    _reconnect_closed_delay = reconnect_closed_delay
-    _reconnect_failed_delay = reconnect_failed_delay
+  fun ref _schedule_reconnect() =>
+    if _disposed then
+      return
+    end
+    // Gradually back off
+    if _reconnect_pause < 8_000_000_000 then
+      _reconnect_pause = _reconnect_pause * 2
+    end
 
-  fun ref received(conn: WallarooOutgoingNetworkActor ref, data: Array[U8] iso,
-    times: USize): Bool
-  =>
+    if (_host != "") and (_service != "") then
+      @printf[I32]("OutgoingBoundary: Scheduling reconnect to %s at %s:%s\n"
+        .cstring(), _target_worker.cstring(), _host.cstring(),
+        _service.cstring())
+      let timer = Timer(_PauseBeforeReconnect(this), _reconnect_pause)
+      _timers(consume timer)
+    end
+
+  fun ref reset_reconnect_pause() =>
+    _reconnect_pause = _initial_reconnect_pause
+
+  fun ref received(data: Array[U8] iso, times: USize): Bool =>
     if _header then
       try
-        let e = Bytes.to_u32(data(0), data(1), data(2), data(3)).usize()
+        let e = Bytes.to_u32(data(0)?, data(1)?, data(2)?, data(3)?).usize()
 
-        conn.expect(e)
+        expect(e)
         _header = false
       end
       true
@@ -967,28 +683,36 @@ class BoundaryNotify is WallarooOutgoingNetworkActorNotify
         @printf[I32]("Rcvd msg at OutgoingBoundary\n".cstring())
       end
       match ChannelMsgDecoder(consume data, _auth)
-      | let ac: AckDataConnectMsg =>
-        ifdef "trace" then
-          @printf[I32]("Received AckDataConnectMsg at Boundary\n".cstring())
-        end
-        conn.receive_connect_ack(ac.last_id_seen)
+      | let dd: DataDisconnectMsg =>
+        dispose()
       | let sn: StartNormalDataSendingMsg =>
         ifdef "trace" then
           @printf[I32]("Received StartNormalDataSendingMsg at Boundary\n"
             .cstring())
         end
-        conn.start_normal_sending()
-      | let aw: AckWatermarkMsg =>
+        @l(Log.debug(), Log.boundary(), "received: worker %s target_worker %s sn.last_id_seen %lu\n".cstring(), _worker_name.cstring(), _target_worker.cstring(), sn.last_id_seen)
+        start_normal_sending(sn.last_id_seen, sn.connection_round)
+      | let aw: AckDataReceivedMsg =>
         ifdef "trace" then
-          @printf[I32]("Received AckWatermarkMsg at Boundary\n".cstring())
+          @printf[I32]("Received AckDataReceivedMsg at Boundary\n".cstring())
         end
-        conn.receive_ack(aw.seq_id)
+        receive_ack(aw.seq_id)
+      | let ra: RequestBoundaryPunctuationAckMsg =>
+        try
+          let ack_msg = ChannelMsgEncoder
+            .receive_boundary_punctuation_ack(_connection_round, _auth)?
+          _tcp_handler.writev(ack_msg)
+        else
+          Fail()
+        end
+      | let ia: ImmediateAckMsg =>
+        receive_immediate_ack()
       else
         @printf[I32](("Unknown Wallaroo data message type received at " +
           "OutgoingBoundary.\n").cstring())
       end
 
-      conn.expect(4)
+      expect(4)
       _header = true
 
       ifdef linux then
@@ -998,33 +722,63 @@ class BoundaryNotify is WallarooOutgoingNetworkActorNotify
       end
     end
 
-  fun ref connecting(conn: WallarooOutgoingNetworkActor ref, count: U32) =>
-    @printf[I32]("BoundaryNotify: attempting to connect...\n\n".cstring())
+  fun ref connecting(count: U32) =>
+    @printf[I32](
+      "OutgoingBoundary: attempting to connect to %s at %s:%s...\n\n"
+        .cstring(), _target_worker.cstring(), _host.cstring(),
+        _service.cstring())
 
-  fun ref connected(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[I32]("BoundaryNotify: connected\n\n".cstring())
-    conn.set_nodelay(true)
-    conn.expect(4)
+  fun ref connected() =>
+    @printf[I32]("OutgoingBoundary: connected to %s at %s:%s...\n\n"
+      .cstring(), _target_worker.cstring(), _host.cstring(),
+      _service.cstring())
+    resend_producer_registrations()
+    reset_reconnect_pause()
+    if _initial_connection_was_established then
+      // This is not the initial time we connected, so we're reconnecting.
+      try
+        let connect_msg = ChannelMsgEncoder.data_connect(_worker_name,
+          _routing_id, seq_id, _connection_round, _auth)?
+        _tcp_handler.writev(connect_msg)
+      else
+        @printf[I32]("error creating data connect message on reconnect\n"
+          .cstring())
+      end
+    else
+      _initial_connection_was_established = true
+    end
+    set_nodelay(true)
+    expect(4)
+    maybe_report_initialized()
+    _maybe_mute_or_unmute_upstreams()
 
-  fun ref closed(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[I32]("BoundaryNotify: closed\n\n".cstring())
+  fun ref closed(locally_initiated_close: Bool) =>
+    @printf[I32]("OutgoingBoundary: closed connection to %s at %s:%s...\n\n"
+      .cstring(), _target_worker.cstring(), _host.cstring(),
+      _service.cstring())
+    _set_connection_not_initialized()
+    if not locally_initiated_close then
+      _schedule_reconnect()
+    end
 
-  fun ref connect_failed(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[I32]("BoundaryNotify: connect_failed\n\n".cstring())
+  fun ref connect_failed() =>
+    @printf[I32]("OutgoingBoundary: connect_failed to %s at %s:%s...\n\n"
+      .cstring(), _target_worker.cstring(), _host.cstring(),
+      _service.cstring())
+    _schedule_reconnect()
 
-  fun ref sentv(conn: WallarooOutgoingNetworkActor ref,
-    data: ByteSeqIter): ByteSeqIter
-  =>
-    data
+  fun ref throttled() =>
+    @printf[I32]("OutgoingBoundary: throttled connection to %s at %s:%s...\n\n"
+      .cstring(), _target_worker.cstring(), _host.cstring(),
+      _service.cstring())
+    _maybe_mute_or_unmute_upstreams()
 
-  fun ref expect(conn: WallarooOutgoingNetworkActor ref, qty: USize): USize =>
-    qty
+  fun ref unthrottled() =>
+    @printf[I32]("OutgoingBoundary: unthrottled connection to %s at %s:%s...\n\n"
+      .cstring(), _target_worker.cstring(), _host.cstring(),
+      _service.cstring())
+    _maybe_mute_or_unmute_upstreams()
 
-  fun ref throttled(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[I32]("BoundaryNotify: throttled\n\n".cstring())
-
-  fun ref unthrottled(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[I32]("BoundaryNotify: unthrottled\n\n".cstring())
 
 class _PauseBeforeReconnect is TimerNotify
   let _ob: OutgoingBoundary

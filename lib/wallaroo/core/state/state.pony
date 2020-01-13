@@ -17,28 +17,80 @@ Copyright 2017 The Wallaroo Authors.
 */
 
 use "buffered"
+use "random"
 use "serialise"
+use "wallaroo/core/common"
+use "wallaroo/core/topology"
+use "wallaroo/core/windows"
 use "wallaroo_labs/mort"
 
 trait ref State
-  fun write_log_entry(out_writer: Writer, auth: AmbientAuth) =>
+
+trait val StateEncoderDecoder[S: State ref]
+  fun encode(state: S, auth: AmbientAuth): ByteSeq
+  fun decode(in_reader: Reader, auth: AmbientAuth): S ?
+
+primitive PonySerializeStateEncoderDecoder[S: State ref] is
+  StateEncoderDecoder[S]
+  fun encode(state: S, auth: AmbientAuth): ByteSeq =>
     try
-      let serialized =
-        Serialised(SerialiseAuth(auth), this).output(OutputSerialisedAuth(auth))
-      out_writer.write(serialized)
+      Serialised(SerialiseAuth(auth), state)?.output(OutputSerialisedAuth(
+        auth))
     else
       Fail()
+      recover Array[U8] end
     end
 
-  fun read_log_entry(in_reader: Reader, auth: AmbientAuth): State ? =>
+  fun decode(in_reader: Reader, auth: AmbientAuth): S ? =>
     try
-      let data: Array[U8] iso = in_reader.block(in_reader.size())
+      let data: Array[U8] iso = in_reader.block(in_reader.size())?
       match Serialised.input(InputSerialisedAuth(auth), consume data)(
-        DeserialiseAuth(auth))
-      | let s: State => s
+        DeserialiseAuth(auth))?
+      | let s: S => s
       else
         error
       end
     else
       error
     end
+
+interface val StateInitializer[In: Any val, Out: Any val, S: State ref] is
+  Computation[In, Out]
+  fun val state_wrapper(key: Key, rand: Random): StateWrapper[In, Out, S]
+  fun name(): String
+  fun timeout_interval(): U64
+  fun val decode(in_reader: Reader, auth: AmbientAuth):
+    StateWrapper[In, Out, S] ?
+
+trait ref StateWrapper[In: Any val, Out: Any val, S: State ref]
+  // Return (output, output_watermark_ts, retain_state)
+  fun ref apply(input: In, event_ts: U64, watermark_ts: U64):
+    (ComputationResult[Out], U64, Bool)
+  fun ref on_timeout(input_watermark_ts: U64, output_watermark_ts: U64):
+    (ComputationResult[Out], U64, Bool)
+  fun ref flush_windows(input_watermark_ts: U64,
+    output_watermark_ts: U64): (ComputationResult[Out], U64, Bool)
+  =>
+    (None, input_watermark_ts, true)
+  fun ref encode(auth: AmbientAuth): ByteSeq
+
+class EmptyState is State
+
+class EmptyStateWrapper[In: Any val, Out: Any val, S: State ref]
+  // Return (output, output_watermark_ts)
+  fun ref apply(input: In, event_ts: U64, watermark_ts: U64):
+    (ComputationResult[Out], U64, Bool)
+  =>
+    Fail()
+    (None, 0, true)
+
+  fun ref on_timeout(input_watermark_ts: U64, output_watermark_ts: U64,
+    watermarks: StageWatermarks): (ComputationResult[Out], U64, Bool)
+  =>
+    Fail()
+    (None, 0, true)
+
+  fun ref encode(auth: AmbientAuth): ByteSeq =>
+    Fail()
+    recover Array[U8] end
+

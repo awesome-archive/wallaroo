@@ -6,7 +6,7 @@ This is an example application that receives strings of text, splits it into ind
 
 ### Input
 
-The inputs of the "Word Count" application are strings encoded in the [source message framing protocol](/book/core-concepts/decoders-and-encoders.md#framed-message-protocols#source-message-framing-protocol). Here's an example of an input message, written as a Python string:
+The inputs of the "Word Count" application are strings encoded in the [source message framing protocol](https://docs.wallaroolabs.com/python-tutorial/tcp-decoders-and-encoders/#framed-message-protocols). Here's an example of an input message, written as a Python string:
 
 ```
 "\x00\x00\x00\x4cMy solitude is cheered by that elegant hope."
@@ -22,60 +22,89 @@ The messages are strings terminated with a newline, with the form `WORD => COUNT
 
 ### Processing
 
-The `Decoder`'s `decode(...)` method turns the input message into a string. That string is then passed to `Split`'s `compute_multi(...)` method, which breaks the string into individual words and returns a list containing these words. Each item in the list is sent as a separate message to the state partition for that word, along with the `CountWords` `compute(...)` method, which updates the existing state with a new count for the word and returns a `WordCount` object. The `WordCount` object is then sent to the `Encoder`'s `encode(...)` method where it is turned into an output message as described above.
+The `decoder` function turns the input message into a string. That string is then passed to the `split` one-to-many computation, which breaks the string into individual words and returns a list containing these words. Each item in the list is sent as a separate message to the partition function which determines which state partition it will go to. At each partition, the word and the `WordTotals` state object for that partition are sent to the `count_word` state computation, which updates word's count by 1, and returns the current count for this word as its output. That count is then sent to the `encoder` function with formats it for output.
 
 ## Running Word Count
 
-In order to run the application you will need Machida, Giles Sender, and the Cluster Shutdown tool. To build them, please see the [Linux](/book/getting-started/linux-setup.md) or [Mac OS](/book/getting-started/macos-setup.md) setup instructions.
+In order to run the application you will need Machida, Giles Sender, and the Cluster Shutdown tool. We provide instructions for building these tools yourself and we provide prebuilt binaries within a Docker container. Please visit our [setup](https://docs.wallaroolabs.com/python-installation/) instructions to choose one of these options if you have not already done so.
+If you are using Python 3, replace all instances of `machida` with `machida3` in your commands.
 
-You will need three separate shells to run this application. Open each shell and go to the `examples/python/word_count` directory.
+You will need five separate shells to run this application (please see [starting a new shell](https://docs.wallaroolabs.com/python-tutorial/starting-a-new-shell/) for details depending on your installation choice). Open each shell and go to the `examples/python/word_count` directory.
 
-### Shell 1
+### Shell 1: Metrics
 
-Run `nc` to listen for TCP output on `127.0.0.1` port `7002`:
-
-```bash
-nc -l 127.0.0.1 7002
-```
-
-### Shell 2
-
-Set `PYTHONPATH` to refer to the current directory (where `celsius.py` is) and the `machida` directory (where `wallaroo.py` is). Set `PATH` to refer to the directory that contains the `machida` executable. Assuming you installed Machida according to the tutorial instructions you would do:
+Start up the Metrics UI if you don't already have it running.
 
 ```bash
-export PYTHONPATH="$PYTHONPATH:.:$HOME/wallaroo-tutorial/wallaroo/machida"
-export PATH="$PATH:$HOME/wallaroo-tutorial/wallaroo/machida/build"
+metrics_reporter_ui start
 ```
+
+You can verify it started up correctly by visiting [http://localhost:4000](http://localhost:4000).
+
+If you need to restart the UI, run the following.
+
+```bash
+metrics_reporter_ui restart
+```
+
+When it's time to stop the UI, run the following.
+
+```bash
+metrics_reporter_ui stop
+```
+
+If you need to start the UI after stopping it, run the following.
+
+```bash
+metrics_reporter_ui start
+```
+
+### Shell 2: Data Receiver
+
+Run Data Receiver to listen for TCP output on `127.0.0.1` port `7002`:
+
+```bash
+data_receiver --ponythreads=1 --ponynoblock \
+  --listen 127.0.0.1:7002
+```
+
+### Shell 3: Word Count
 
 Run `machida` with `--application-module word_count`:
 
 ```bash
-machida --application-module word_count --in 127.0.0.1:7010 --out 127.0.0.1:7002 \
+machida --application-module word_count --in 'Split and Count@127.0.0.1:7010' --out 127.0.0.1:7002 \
   --metrics 127.0.0.1:5001 --control 127.0.0.1:6000 --data 127.0.0.1:6001 \
   --name worker-name --external 127.0.0.1:5050 --cluster-initializer \
-  --ponythreads=1
+  --ponythreads=1 --ponynoblock
 ```
 
-### Shell 3
+### Shell 4: Sender
 
-In a third shell, send some messages:
+Send messages:
 
 ```bash
-../../../giles/sender/sender --host 127.0.0.1:7010 --file count_this.txt \
+sender --host 127.0.0.1:7010 --file count_this.txt \
   --batch-size 5 --interval 100_000_000 --messages 10000000 \
-  --ponythreads=1 --repeat --no-write
+  --ponythreads=1 --ponynoblock --repeat --no-write
 ```
 
 ## Reading the Output
 
-There will be a stream of output messages in the first shell (where you ran `nc`).
+There will be a stream of output messages in the Shell 2.
 
-## Shutdown
+## Shell 5: Shutdown
 
-You can shut down the cluster with this command once processing has finished:
+You can shut down the Wallaroo cluster with this command once processing has finished:
 
 ```bash
-../../../utils/cluster_shutdown/cluster_shutdown 127.0.0.1:5050
+cluster_shutdown 127.0.0.1:5050
 ```
 
-You can shut down Giles Sender by pressing `Ctrl-c` from its shell.
+You can shut down Giles Sender and Data Receiver by pressing `Ctrl-c` from their respective shells.
+
+You can shut down the Metrics UI with the following command.
+
+```bash
+metrics_reporter_ui stop
+```

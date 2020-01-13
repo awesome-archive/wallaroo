@@ -27,6 +27,8 @@ function formatThroughput(thr) {
         return "0k";
     } else if (thr == "-") {
         return thr;
+    } else if (thr < 1000) {
+        return thr;
     } else if (thr > 10000) {
         return cleanTrailing(thr/1000, 0) + "k";
     } else if (thr >= 1000000) {
@@ -195,16 +197,16 @@ function isUpperCase(str) {
     return str === str.toUpperCase();
 }
 
-export default {
-    throughputInThousands: throughputInThousands,
-    numberWithCommas: numberWithCommas,
-    formatTime: formatTime,
-    formatThroughput: formatThroughput,
-    formatLatency: formatLatency,
-    displayInterval: displayInterval,
-    labelForLimit: labelForLimit,
-    latencyInMilliseconds: latencyInMilliseconds,
-    formatOrderId: formatOrderId,
-    formatLatencyBin: formatLatencyBin,
-    titleize: titleize
+export {
+    throughputInThousands,
+    numberWithCommas,
+    formatTime,
+    formatThroughput,
+    formatLatency,
+    displayInterval,
+    labelForLimit,
+    latencyInMilliseconds,
+    formatOrderId,
+    formatLatencyBin,
+    titleize
 }

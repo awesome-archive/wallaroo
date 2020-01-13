@@ -29,7 +29,6 @@ use "time"
 use "wallaroo_labs/bytes"
 use "wallaroo_labs/messages"
 use "wallaroo_labs/options"
-use "wallaroo_labs/tcp"
 use "wallaroo_labs/time"
 
 // documentation
@@ -47,6 +46,7 @@ actor Main
     var msg_size: USize = 80
     var write_to_file: Bool = true
     var binary_integer: Bool = false
+    var partition: String = ""
     var start_from: U64 = 0
     var vary_by: U64 = 0
 
@@ -55,8 +55,6 @@ actor Main
     else
       var h_arg: (Array[String] | None) = None
       var m_arg: (USize | None) = None
-      var p_arg: (Array[String] | None) = None
-      var n_arg: (String | None) = None
       var f_arg: (String | None) = None
       var g_arg: (USize | None) = None
       var z_arg: (Bool | None) = None
@@ -66,8 +64,6 @@ actor Main
 
         options
           .add("host", "h", StringArgument)
-          .add("phone-home", "p", StringArgument)
-          .add("name", "n", StringArgument)
           .add("messages", "m", I64Argument)
           .add("file", "f", StringArgument)
           .add("batch-size", "s", I64Argument)
@@ -80,6 +76,7 @@ actor Main
           .add("msg-size", "g", I64Argument)
           .add("no-write", "w", None)
           .add("vary-by", "j", I64Argument)
+          .add("partition", "p", StringArgument)
 
         for option in options do
           match option
@@ -87,12 +84,8 @@ actor Main
             h_arg = arg.split(":")
           | ("messages", let arg: I64) =>
             m_arg = arg.usize()
-          | ("name", let arg: String) =>
-            n_arg = arg
           | ("file", let arg: String) =>
             f_arg = arg
-          | ("phone-home", let arg: String) =>
-            p_arg = arg.split(":")
           | ("batch-size", let arg: I64) =>
             batch_size = arg.usize()
           | ("interval", let arg: I64) =>
@@ -113,6 +106,8 @@ actor Main
             write_to_file = false
           | ("vary-by", let arg: I64) =>
             vary_by = arg.u64()
+          | ("partition", let arg: String) =>
+            partition = arg
           end
         end
 
@@ -131,24 +126,6 @@ actor Main
         if m_arg is None then
           @printf[I32]("Must supply required '--messages' argument\n".cstring())
           required_args_are_present = false
-        end
-
-        if p_arg isnt None then
-          if (p_arg as Array[String]).size() != 2 then
-            @printf[I32](
-              "'--dagon' argument should be in format: '127.0.0.1:8080\n"
-              .cstring())
-            required_args_are_present = false
-          end
-        end
-
-        if (p_arg isnt None) or (n_arg isnt None) then
-          if (p_arg is None) or (n_arg is None) then
-            @printf[I32](
-              "'--dagon' must be used in conjunction with '--name'\n"
-              .cstring())
-            required_args_are_present = false
-          end
         end
 
         if (g_arg isnt None) and variable_size then
@@ -172,7 +149,7 @@ actor Main
           let fs: Array[String] = recover f.split(",") end
           try
             for str in (consume fs).values() do
-              let path = FilePath(env.root as AmbientAuth, str)
+              let path = FilePath(env.root as AmbientAuth, str)?
               if not path.exists() then
                 @printf[I32](("Error opening file '" + str + "'.\n").cstring())
                 required_args_are_present = false
@@ -185,14 +162,14 @@ actor Main
           let messages_to_send = m_arg as USize
           let to_host_addr = h_arg as Array[String]
 
-          let store = Store(env.root as AmbientAuth)
-          let coordinator = CoordinatorFactory(env, store, n_arg, p_arg)
+          let store = Store(write_to_file, env.root as AmbientAuth)
+          let coordinator = Coordinator(env, store)?
 
           let tcp_auth = TCPConnectAuth(env.root as AmbientAuth)
           let to_host_socket = TCPConnection(tcp_auth,
             ToHostNotify(coordinator),
-            to_host_addr(0),
-            to_host_addr(1))
+            to_host_addr(0)?,
+            to_host_addr(1)?)
 
           let data_source =
             match f_arg
@@ -201,7 +178,7 @@ actor Main
               let paths: Array[FilePath] iso =
                 recover Array[FilePath] end
               for str in (consume fs).values() do
-                paths.push(FilePath(env.root as AmbientAuth, str))
+                paths.push(FilePath(env.root as AmbientAuth, str)?)
               end
               if binary_fmt then
                 if variable_size then
@@ -216,7 +193,7 @@ actor Main
               end
             else
               if binary_integer then
-                BinaryIntegerDataSource(start_from)
+                BinaryIntegerDataSource(start_from, partition)
               else
                 IntegerDataSource(start_from)
               end
@@ -263,73 +240,9 @@ class ToHostNotify is TCPConnectionNotify
   fun ref unthrottled(sock: TCPConnection ref) =>
     _coordinator.pause_sending(false)
 
-class ToDagonNotify is TCPConnectionNotify
-  let _coordinator: WithDagonCoordinator
-  let _framer: Framer = Framer
-  let _stderr: StdStream
-
-  new iso create(coordinator: WithDagonCoordinator, stderr: StdStream) =>
-    _coordinator = coordinator
-    _stderr = stderr
-
-  fun ref connect_failed(sock: TCPConnection ref) =>
-    _coordinator.to_dagon_socket(sock, Failed)
-
-  fun ref connected(sock: TCPConnection ref) =>
-    if sock.local_address() != sock.remote_address() then
-      sock.set_nodelay(true)
-    end
-    _coordinator.to_dagon_socket(sock, Ready)
-
-  fun ref received(conn: TCPConnection ref, data: Array[U8] iso,
-    n: USize):
-  Bool =>
-    for chunked in _framer.chunk(consume data).values() do
-      try
-        let decoded = ExternalMsgDecoder(consume chunked)
-        match decoded
-        | let m: ExternalStartMsg =>
-            _coordinator.go()
-        else
-          @printf[I32]("Unexpected message from Dagon\n".cstring())
-        end
-      else
-        @printf[I32]("Unable to decode message from Dagon\n".cstring())
-      end
-    end
-    true
-
 //
 // COORDINATE OUR STARTUP
 //
-
-primitive CoordinatorFactory
-  fun apply(env: Env,
-    store: Store,
-    node_id: (String | None),
-    to_dagon_addr: (Array[String] | None)): Coordinator ?
-  =>
-    if (node_id isnt None) and (to_dagon_addr isnt None) then
-      let n = node_id as String
-      let ph = to_dagon_addr as Array[String]
-      let coordinator = WithDagonCoordinator(env, store, n)
-
-      let tcp_auth = TCPConnectAuth(env.root as AmbientAuth)
-      let to_dagon_socket = TCPConnection(tcp_auth,
-        ToDagonNotify(coordinator, env.err),
-        ph(0),
-        ph(1))
-
-      coordinator
-    else
-      WithoutDagonCoordinator(env, store)
-    end
-
-interface tag Coordinator
-  be finished()
-  be sending_actor(sa: SendingActor)
-  be to_host_socket(sock: TCPConnection, state: WorkerState)
-  be pause_sending(v: Bool)
 
 primitive Waiting
 primitive Ready
@@ -337,7 +250,7 @@ primitive Failed
 
 type WorkerState is (Waiting | Ready | Failed)
 
-actor WithoutDagonCoordinator
+actor Coordinator
   let _env: Env
   var _to_host_socket: ((TCPConnection | None), WorkerState) = (None, Waiting)
   var _sending_actor: (SendingActor | None) = None
@@ -379,75 +292,6 @@ actor WithoutDagonCoordinator
         let y = _sending_actor as SendingActor
         y.go()
       end
-    end
-
-actor WithDagonCoordinator
-  let _env: Env
-  var _to_host_socket: ((TCPConnection | None), WorkerState) = (None, Waiting)
-  var _to_dagon_socket: ((TCPConnection | None), WorkerState) = (None, Waiting)
-  var _sending_actor: (SendingActor | None) = None
-  let _store: Store
-  let _node_id: String
-
-  new create(env: Env, store: Store, node_id: String) =>
-    _env = env
-    _store = store
-    _node_id = node_id
-
-  be go() =>
-    try
-      let y = _sending_actor as SendingActor
-      y.go()
-    end
-
-  be to_host_socket(sock: TCPConnection, state: WorkerState) =>
-    _to_host_socket = (sock, state)
-    if state is Failed then
-      @printf[I32]("Unable to open host socket\n".cstring())
-      sock.dispose()
-    elseif state is Ready then
-      _go_if_ready()
-    end
-
-  be to_dagon_socket(sock: TCPConnection, state: WorkerState) =>
-    _to_dagon_socket = (sock, state)
-    if state is Failed then
-      @printf[I32]("Unable to open dagon socket\n".cstring())
-      sock.dispose()
-    elseif state is Ready then
-      _go_if_ready()
-    end
-
-  be sending_actor(sa: SendingActor) =>
-    _sending_actor = sa
-
-  be finished() =>
-    try
-      let x = _to_dagon_socket._1 as TCPConnection
-      x.writev(ExternalMsgEncoder.done_shutdown(_node_id as String))
-      x.dispose()
-    end
-    try
-      let x = _to_host_socket._1 as TCPConnection
-      x.dispose()
-    end
-    _store.dispose()
-
-  be pause_sending(v: Bool) =>
-    try
-      let sa = _sending_actor as SendingActor
-      sa.pause(v)
-    end
-
-  fun _go_if_ready() =>
-    if (_to_dagon_socket._2 is Ready) and (_to_host_socket._2 is Ready) then
-      _send_ready()
-    end
-
-  fun _send_ready() =>
-    try
-      let x = _to_dagon_socket._1 as TCPConnection
-      x.writev(ExternalMsgEncoder.ready(_node_id as String))
     end
 
 //
@@ -535,7 +379,7 @@ actor SendingActor
       for i in Range(0, current_batch_size) do
         try
           if _binary_fmt then
-            let n = _data_source.next()
+            let n = _data_source.next()?
             if n.size() > 0 then
               d'.push(n)
               if _variable_size then
@@ -545,7 +389,7 @@ actor SendingActor
               _messages_sent = _messages_sent + 1
             end
           else
-            let n = _data_source.next()
+            let n = _data_source.next()?
             if n.size() > 0 then
               d'.push(n)
               _wb.u32_be(n.size().u32())
@@ -591,14 +435,19 @@ actor Store
   let _encoder: SentLogEncoder = SentLogEncoder
   var _sent_file: (File|None)
 
-  new create(auth: AmbientAuth) =>
-    _sent_file = try
-      let f = File(FilePath(auth, "sent.txt"))
-      f.set_length(0)
-      f
-    else
-      None
-    end
+  new create(write_to_file: Bool, auth: AmbientAuth) =>
+    _sent_file =
+      if write_to_file then
+        try
+          let f = File(FilePath(auth, "sent.txt")?)
+          f.set_length(0)
+          f
+        else
+          None
+        end
+      else
+        None
+      end
 
   be sentv(msgs: Array[ByteSeq] val, at: U64) =>
     match _sent_file
@@ -620,9 +469,9 @@ class SentLogEncoder
 
     recover
       String(time.size() + ", ".size() + payload.size())
-      .append(time)
-      .append(", ")
-      .append(payload)
+      .>append(time)
+      .>append(", ")
+      .>append(payload)
     end
 
 //
@@ -644,32 +493,44 @@ class IntegerDataSource is Iterator[String]
 
 class BinaryIntegerDataSource is Iterator[Array[U8] val]
   var _counter: U64
+  let _partition: String
+  let _length: U32
 
-  new iso create(start_from: U64 = 0) =>
+  new iso create(start_from: U64 = 0, partition: String = "") =>
     _counter = start_from
+    _partition = partition
+    _length = 8 + partition.size().u32()
 
   fun ref has_next(): Bool =>
     true
 
   fun ref next(): Array[U8] val =>
     _counter = _counter + 1
-    Bytes.from_u64(_counter, Bytes.from_u32(U32(8)))
+    let out: Array[U8] iso = Bytes.from_u64(_counter,
+      Bytes.from_u32(U32(_length)))
+    out.append(_partition)
+    consume out
 
 class FileDataSource is Iterator[String]
   let _lines: Iterator[String]
+  let _file: File
 
   new iso create(path: FilePath val) =>
-    _lines = File(path).lines()
+    _file = File.open(path)
+    _lines = _file.lines()
 
   fun ref has_next(): Bool =>
     _lines.has_next()
 
   fun ref next(): String ? =>
     if has_next() then
-      _lines.next()
+      _lines.next()?
     else
       error
     end
+
+  fun ref dispose() =>
+    _file.dispose()
 
 class MultiFileDataSource is Iterator[String]
   let _paths: Array[FilePath val] val
@@ -682,7 +543,7 @@ class MultiFileDataSource is Iterator[String]
     _paths = paths
     _cur_source =
       try
-        FileDataSource(_paths(_idx))
+        FileDataSource(_paths(_idx)?)
       else
         None
       end
@@ -694,16 +555,18 @@ class MultiFileDataSource is Iterator[String]
       if f.has_next() then
         true
       else
+        f.dispose()
         _idx = _idx + 1
         try
-          _cur_source = FileDataSource(_paths(_idx))
+          _cur_source = FileDataSource(_paths(_idx)?)
           has_next()
         else
           if _should_repeat then
+            f.dispose()
             _idx = 0
             _cur_source =
               try
-                FileDataSource(_paths(_idx))
+                FileDataSource(_paths(_idx)?)
               else
                 None
               end
@@ -721,7 +584,7 @@ class MultiFileDataSource is Iterator[String]
     if has_next() then
       match _cur_source
       | let f: FileDataSource =>
-        f.next()
+        f.next()?
       else
         error
       end
@@ -742,7 +605,7 @@ class MultiFileBinaryDataSource is Iterator[Array[U8 val] val]
     _msg_size = msg_size
     _cur_source =
       try
-        BinaryFileDataSource(_paths(_idx), _msg_size)
+        BinaryFileDataSource(_paths(_idx)?, _msg_size)
       else
         None
       end
@@ -754,16 +617,18 @@ class MultiFileBinaryDataSource is Iterator[Array[U8 val] val]
       if f.has_next() then
         true
       else
+        f.dispose()
         _idx = _idx + 1
         try
-          _cur_source = BinaryFileDataSource(_paths(_idx), _msg_size)
+          _cur_source = BinaryFileDataSource(_paths(_idx)?, _msg_size)
           has_next()
         else
           if _should_repeat then
+            f.dispose()
             _idx = 0
             _cur_source =
               try
-                BinaryFileDataSource(_paths(_idx), _msg_size)
+                BinaryFileDataSource(_paths(_idx)?, _msg_size)
               else
                 None
               end
@@ -799,7 +664,7 @@ class MultiFileVariableBinaryDataSource is Iterator[Array[U8 val] val]
     _paths = paths
     _cur_source =
       try
-        VariableLengthBinaryFileDataSource(_paths(_idx))
+        VariableLengthBinaryFileDataSource(_paths(_idx)?)
       else
         None
       end
@@ -811,16 +676,18 @@ class MultiFileVariableBinaryDataSource is Iterator[Array[U8 val] val]
       if f.has_next() then
         true
       else
+        f.dispose()
         _idx = _idx + 1
         try
-          _cur_source = VariableLengthBinaryFileDataSource(_paths(_idx))
+          _cur_source = VariableLengthBinaryFileDataSource(_paths(_idx)?)
           has_next()
         else
           if _should_repeat then
+            f.dispose()
             _idx = 0
             _cur_source =
               try
-                VariableLengthBinaryFileDataSource(_paths(_idx))
+                VariableLengthBinaryFileDataSource(_paths(_idx)?)
               else
                 None
               end
@@ -851,7 +718,7 @@ class BinaryFileDataSource is Iterator[Array[U8] val]
   let _msg_size: USize
 
   new iso create(path: FilePath val, msg_size: USize) =>
-    _file = File(path)
+    _file = File.open(path)
     _msg_size = msg_size
 
   fun ref has_next(): Bool =>
@@ -864,11 +731,14 @@ class BinaryFileDataSource is Iterator[Array[U8] val]
   fun ref next(): Array[U8] val =>
     _file.read(_msg_size)
 
+  fun ref dispose() =>
+    _file.dispose()
+
 class VariableLengthBinaryFileDataSource is Iterator[Array[U8] val]
   let _file: File
 
   new iso create(path: FilePath val) =>
-    _file = File(path)
+    _file = File.open(path)
 
   fun ref has_next(): Bool =>
     if _file.position() < _file.size() then
@@ -880,7 +750,7 @@ class VariableLengthBinaryFileDataSource is Iterator[Array[U8] val]
   fun ref next(): Array[U8] val =>
     let h = _file.read(4)
     try
-      let expect: USize = Bytes.to_u32(h(0), h(1), h(2), h(3)).usize()
+      let expect: USize = Bytes.to_u32(h(0)?, h(1)?, h(2)?, h(3)?).usize()
       _file.read(expect)
     else
       ifdef debug then
@@ -888,3 +758,6 @@ class VariableLengthBinaryFileDataSource is Iterator[Array[U8] val]
       end
       recover val Array[U8] end
     end
+
+  fun ref dispose() =>
+    _file.dispose()

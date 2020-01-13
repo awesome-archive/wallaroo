@@ -17,15 +17,27 @@ Copyright 2017 The Wallaroo Authors.
 */
 
 use "collections"
+use "promises"
 use "wallaroo/core/boundary"
-use "wallaroo/ent/data_receiver"
+use "wallaroo/core/common"
 use "wallaroo/core/messages"
+use "wallaroo/core/data_receiver"
+use "wallaroo/core/checkpoint"
 
 trait tag LayoutInitializer
   be initialize(cluster_initializer: (ClusterInitializer | None) = None,
-    recovering: Bool)
+    checkpoint_target: (CheckpointId | None) = None,
+    recovering_without_resilience: Bool = false)
 
-  be receive_immigrant_step(msg: StepMigrationMsg)
+  be report_created(initializable: Initializable)
+
+  be report_initialized(initializable: Initializable)
+
+  be report_ready_to_work(initializable: Initializable)
+
+  be worker_report_ready_to_work(w: WorkerName)
+
+  be all_workers_ready_to_work()
 
   be update_boundaries(bs: Map[String, OutgoingBoundary] val,
     bbs: Map[String, OutgoingBoundaryBuilder] val)
@@ -33,3 +45,6 @@ trait tag LayoutInitializer
   be create_data_channel_listener(ws: Array[String] val,
     host: String, service: String,
     cluster_initializer: (ClusterInitializer | None) = None)
+
+  be rollback_local_keys(checkpoint_id: CheckpointId,
+    promise: Promise[None])

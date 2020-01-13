@@ -30,9 +30,19 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 use "collections"
 use "net"
 use "wallaroo/core/boundary"
-use "wallaroo/ent/data_receiver"
-use "wallaroo/ent/router_registry"
+use "wallaroo/core/data_receiver"
+use "wallaroo/core/registries"
 use "wallaroo/core/topology"
+
+use @pony_asio_event_create[AsioEventID](owner: AsioEventNotify, fd: U32,
+  flags: U32, nsec: U64, noisy: Bool)
+use @pony_asio_event_fd[U32](event: AsioEventID)
+use @pony_asio_event_unsubscribe[None](event: AsioEventID)
+use @pony_asio_event_resubscribe_read[None](event: AsioEventID)
+use @pony_asio_event_resubscribe_write[None](event: AsioEventID)
+use @pony_asio_event_destroy[None](event: AsioEventID)
+use @pony_asio_event_set_writeable[None](event: AsioEventID, writeable: Bool)
+
 
 type DataChannelListenerAuth is (AmbientAuth | NetAuth | TCPAuth |
   TCPListenAuth)
@@ -47,6 +57,8 @@ actor DataChannelListener
   var _paused: Bool = false
   var _init_size: USize
   var _max_size: USize
+  let _requested_host: String
+  let _requested_service: String
 
   let _router_registry: RouterRegistry
 
@@ -59,6 +71,8 @@ actor DataChannelListener
     """
     Listens for both IPv4 and IPv6 connections.
     """
+    _requested_host = host
+    _requested_service = service
     _router_registry = router_registry
     _limit = limit
     _notify = consume notify
@@ -81,11 +95,19 @@ actor DataChannelListener
     """
     close()
 
-  fun local_address(): IPAddress =>
+  fun requested_address(): (String, String) =>
+    """
+    Return the host and service that were originally provided to the
+    @pony_os_listen_tcp method.
+    Use this if `local_address().name()` fails.
+    """
+    (_requested_host, _requested_service)
+
+  fun local_address(): NetAddress =>
     """
     Return the bound IP address.
     """
-    let ip = recover IPAddress end
+    let ip = recover NetAddress end
     @pony_os_sockname[Bool](_fd, ip)
     ip
 
@@ -171,14 +193,10 @@ actor DataChannelListener
     """
     Spawn a new connection.
     """
-    try
-      let data_channel = DataChannel._accept(this, _notify.connected(this,
-        _router_registry), ns, _init_size, _max_size)
-      _router_registry.register_data_channel(data_channel)
-      _count = _count + 1
-    else
-      @pony_os_socket_close[None](ns)
-    end
+    let data_channel = _notify.connected(this, _router_registry,
+      ns, _init_size, _max_size)
+    _router_registry.register_data_channel(data_channel)
+    _count = _count + 1
 
   fun ref _notify_listening() =>
     """
@@ -202,13 +220,13 @@ actor DataChannelListener
     _closed = true
 
     if not _event.is_null() then
-      @pony_os_socket_close[None](_fd)
-      _fd = -1
-
       // When not on windows, the unsubscribe is done immediately.
       ifdef not windows then
         @pony_asio_event_unsubscribe(_event)
       end
+
+      @pony_os_socket_close[None](_fd)
+      _fd = -1
 
       _notify.closed(this)
     end

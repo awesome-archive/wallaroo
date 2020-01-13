@@ -18,9 +18,14 @@ Copyright 2017 The Wallaroo Authors.
 
 use "options"
 use "wallaroo"
+use "wallaroo/core/common"
 use "wallaroo/core/messages"
 use "wallaroo/core/metrics"
 use "wallaroo/core/sink"
+use "wallaroo/core/barrier"
+use "wallaroo/core/recovery"
+use "wallaroo/core/checkpoint"
+use "wallaroo_labs/mort"
 
 primitive TCPSinkConfigCLIParser
   fun apply(args: Array[String] val): Array[TCPSinkConfigOptions] val ? =>
@@ -37,7 +42,7 @@ primitive TCPSinkConfigCLIParser
       | ("help", let arg: None) =>
         StartupHelp()
       | (out_arg, let output: String) =>
-        return _from_output_string(output)
+        return _from_output_string(output)?
       end
     end
 
@@ -48,7 +53,7 @@ primitive TCPSinkConfigCLIParser
 
     for output in outputs.split(",").values() do
       let o = output.split(":")
-      opts.push(TCPSinkConfigOptions(o(0), o(1)))
+      opts.push(TCPSinkConfigOptions(o(0)?, o(1)?))
     end
 
     consume opts
@@ -86,27 +91,45 @@ class val TCPSinkConfig[Out: Any val] is SinkConfig[Out]
     _service = opts.service
 
 
-  fun apply(): SinkBuilder =>
+  fun apply(parallelism: USize): SinkBuilder =>
     TCPSinkBuilder(TypedTCPEncoderWrapper[Out](_encoder), _host, _service,
-      _initial_msgs)
+      _initial_msgs, parallelism)
 
 class val TCPSinkBuilder
   let _encoder_wrapper: TCPEncoderWrapper
   let _host: String
   let _service: String
   let _initial_msgs: Array[Array[ByteSeq] val] val
+  let _parallelism: USize
 
   new val create(encoder_wrapper: TCPEncoderWrapper, host: String,
-    service: String, initial_msgs: Array[Array[ByteSeq] val] val)
+    service: String, initial_msgs: Array[Array[ByteSeq] val] val,
+    parallelism': USize)
   =>
     _encoder_wrapper = encoder_wrapper
     _host = host
     _service = service
     _initial_msgs = initial_msgs
+    _parallelism = parallelism'
 
-  fun apply(reporter: MetricsReporter iso): Sink =>
+  fun apply(sink_name: String, event_log: EventLog,
+    reporter: MetricsReporter iso, env: Env,
+    barrier_coordinator: BarrierCoordinator, checkpoint_initiator: CheckpointInitiator,
+    recovering: Bool, app_name: String, worker_name: WorkerName,
+    auth: AmbientAuth): Sink
+  =>
     @printf[I32](("Connecting to sink at " + _host + ":" + _service + "\n")
       .cstring())
 
-    TCPSink(_encoder_wrapper, consume reporter, _host, _service,
+    let id: RoutingId = try RoutingIdFromStringGenerator(
+      app_name + sink_name + worker_name + "-tcp-sink-" + _host + _service)?
+      else Fail(); 0
+      end
+
+    TCPSink(id, sink_name, event_log, recovering, env, _encoder_wrapper,
+      consume reporter, barrier_coordinator, checkpoint_initiator, _host, _service,
       _initial_msgs)
+
+  fun parallelism(): USize =>
+    _parallelism
+

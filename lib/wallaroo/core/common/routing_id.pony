@@ -17,4 +17,4 @@ Copyright 2017 The Wallaroo Authors.
 */
 
 type SeqId is U64
-type RouteId is U64
+type RoutingId is U128

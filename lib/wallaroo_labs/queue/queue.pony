@@ -21,6 +21,17 @@ use "debug"
 use "assert"
 
 class Queue[A: Any #alias]
+  """
+  A queue with expanding size for it's elements.
+  
+  The queue is backed by an array for its elements and expands
+  the size by doubling the allocation when the queue size
+  reaches the allocated size.
+
+  An error is raised when
+  * `apply` or `_update` is called with an index that is out of bounds
+  * `dequeue` or `peek` is called when the queue is empty
+  """
   embed _data: Array[A]
   var _front_ptr: USize = 0
   var _back_ptr: USize = 0
@@ -50,7 +61,7 @@ class Queue[A: Any #alias]
     raising an error if the index is out of bounds.
     """
     if i < _size then
-      _data((i + _front_ptr) and _mod)
+      _data((i + _front_ptr) and _mod)?
     else
       error
     end
@@ -59,7 +70,7 @@ class Queue[A: Any #alias]
     """
     Change the i-th element, raising an error if the index is out of bounds.
     """
-    _data(i) = consume value
+    _data(i)? = consume value
 
   fun ref enqueue(a: A) ? =>
     """
@@ -73,12 +84,12 @@ class Queue[A: Any #alias]
         _back_ptr = _data.size()
       elseif _back_ptr >= space() then
         _back_ptr = 0
-        _data(0) = consume a
+        _data(0)? = consume a
       elseif _back_ptr >= _data.size() then
         _data.push(consume a)
         _back_ptr = (_back_ptr + 1) and _mod
       else
-        _data(_back_ptr) = consume a
+        _data(_back_ptr)? = consume a
         _back_ptr = (_back_ptr + 1) and _mod
       end
     else
@@ -91,12 +102,12 @@ class Queue[A: Any #alias]
         _back_ptr = _data.size()
       elseif _front_ptr > _back_ptr then
         for i in Range(0, _back_ptr) do
-          _data.push(_data(i))
+          _data.push(_data(i)?)
         end
         _data.push(consume a)
         _back_ptr = _data.size() and _mod
       else
-        _data(_back_ptr) = consume a
+        _data(_back_ptr)? = consume a
         _back_ptr = _back_ptr + 1
       end
     end
@@ -104,7 +115,7 @@ class Queue[A: Any #alias]
 
   fun ref dequeue(): A! ? =>
     if _size > 0 then
-      let a = _data(_front_ptr)
+      let a = _data(_front_ptr)?
       _front_ptr = (_front_ptr + 1) and _mod
       _size = _size - 1
       a
@@ -113,8 +124,12 @@ class Queue[A: Any #alias]
     end
 
   fun peek(): this->A ? =>
+    """
+    Return the first element from the front of the queue
+    raising an error if the queue is empty.
+    """
     if _size > 0 then
-      _data(_front_ptr)
+      _data(_front_ptr)?
     else
       error
     end
@@ -130,6 +145,10 @@ class Queue[A: Any #alias]
     this
 
   fun ref clear_n(n: USize) =>
+    """
+    Clear the first `n` elements or all the elements from
+    the queue if n is greater than the current queue size.
+    """
     if (_size > 0) and (n > 0) then
       let to_clear = if _size < (n - 1) then (_size - 1) else n end
       _front_ptr = (_front_ptr + to_clear) and _mod
@@ -144,15 +163,15 @@ class Queue[A: Any #alias]
     try
       if _front_ptr < _back_ptr then
         for i in Range(_front_ptr, _back_ptr) do
-          if pred(_data(i), a) then return true end
+          if pred(_data(i)?, a) then return true end
         end
         return false
       else
         for i in Range(_front_ptr, _data.size()) do
-          if pred(_data(i), a) then return true end
+          if pred(_data(i)?, a) then return true end
         end
         for i in Range(0, _back_ptr) do
-          if pred(_data(i), a) then return true end
+          if pred(_data(i)?, a) then return true end
         end
         return false
       end
@@ -161,12 +180,21 @@ class Queue[A: Any #alias]
     end
 
   fun values(): QueueValues[A, this->Array[A]]^ =>
+    """
+    Return a `QueueValues` iterator.
+    """
     QueueValues[A, this->Array[A]](_data, _front_ptr, _back_ptr)
 
   fun pairs(): QueuePairs[A, this->Array[A]]^ =>
+    """
+    Return a `QueuePairs` iterator.
+    """
     QueuePairs[A, this->Array[A]](_data, _front_ptr, _back_ptr)
 
 class QueueValues[A, B: Array[A] #read] is Iterator[B->A]
+  """
+  An `Iterator` over the elements in the queue.
+  """
   let _data: B
   var _front: USize
   var _last_front: USize
@@ -189,7 +217,7 @@ class QueueValues[A, B: Array[A] #read] is Iterator[B->A]
 
   fun ref next(): B->A ? =>
     _last_front = _front
-    _data(_front = (_front + 1) % _data.size())
+    _data(_front = (_front + 1) % _data.size())?
 
   fun ref rewind(): QueueValues[A, B] =>
     _front = _initial_front
@@ -197,6 +225,10 @@ class QueueValues[A, B: Array[A] #read] is Iterator[B->A]
     this
 
 class QueuePairs[A, B: Array[A] #read] is Iterator[(USize, B->A)]
+  """
+  An `Iterator` of tuples `(USize, B->A)` with elements in the queue
+  and their corresponding relative indexes from the front of the queue.
+  """
   let _data: B
   var _front: USize
   var _last_front: USize
@@ -225,5 +257,5 @@ class QueuePairs[A, B: Array[A] #read] is Iterator[(USize, B->A)]
       else
         _front + (_data.size() - _initial_front)
       end
-    (relative_idx, _data(_front = (_front + 1) % _data.size()))
+    (relative_idx, _data(_front = (_front + 1) % _data.size())?)
 

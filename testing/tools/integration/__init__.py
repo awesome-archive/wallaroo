@@ -14,75 +14,53 @@
 
 
 """
-Integration contains everything that's required to run integration
-tests for a Wallaro application (Python, Pony, or otherwise) via a Python
-script.
-
-It has:
-    - TCPReceiver: a multi-client TCP sink receiver
-    - Metrics: an alias for TCPReceiver
-    - Sink: an alias for TCPReceiver
-    - Sender: a TCP sender
-    - Reader: a buffered reader interface wrapper for bytestream generators
-    - files_generator: a file source supporting both newlines and framed modes
-    - sequence_generator: a framed source encoded U64 sequence generator
-        (binary)
-    - iter_generator: a generic framed source encoded generator that operates on
-        iterators. It takes an optional `to_string` lambda for converting
-        iterator items to strings.
-    - files_generator: a generic
-    - Runner: Runs a single Wallaroo worker with command line parameters.
-    - ex_validation: a function to execute external validation commands and
-      capture their outputs
-
-You will need to include /testing/tools in your PYTHONPATH, and the
-application binary in your PATH before running your integration test.
-
-Below is an example for running the integration test on reverse, a
-python-wallaroo application, using the machida binary, the wallaroo python
-api, and the the integration tester utility. The integration test script
-can be found at
-https://github.com/WallarooLabs/wallaroo/examples/python/reverse/_test.py.
-
-```bash
-# Add integration utility to PYTHONPATH
-export PYTHONPATH="$PYTHONPATH:~/wallaroo-tutorial/wallaroo/testing/tools"
-# Add wallaroo to PYTHONPATH
-export PYTHONPATH="$PYTHONPATH:~/wallaroo-tutorial/wallaroo/machida:."
-# Add machida to PATH
-export PATH="%PATH:~/wallaroo-tutorial/wallaroo/machida/build"
-
-# Run integration test
-python2 -m pytest _test.py --verbose
-```
-
-
-Alternatively, for a CLI style integration tester, you may use the
-`integration_test` CLI. Add
-`~/wallaroo-tutorial/wallaroo/testing/tools/integration` to your PATH, then
-`integration_test -h` for instructions.
+Clear out previous test run temp data
 """
 
+import os
+import shutil
 
-from integration import (clean_up_resilience_path,
-                         ex_validate,
-                         files_generator,
-                         get_port_values,
-                         is_address_available,
-                         iter_generator,
-                         Metrics,
-                         MetricsStopper,
-                         Reader,
-                         Runner,
-                         RunnerChecker,
-                         RunnerReadyChecker,
-                         Sender,
-                         sequence_generator,
-                         setup_resilience_path,
-                         start_runners,
-                         pipeline_test,
-                         Sink,
-                         SinkAwaitValue,
-                         SinkExpect,
-                         TCPReceiver,
-                         TimeoutError)
+from .external import makedirs_if_not_exists
+from .logger import add_file_logger
+
+
+BASE_LOG_DIR = '/tmp/wallaroo_test_errors/current_test'
+print("Clearing out {}".format(BASE_LOG_DIR))
+shutil.rmtree(BASE_LOG_DIR, True)
+
+# Create the dir again
+makedirs_if_not_exists(BASE_LOG_DIR)
+
+# Add a file logger saving to it in DEBUG level
+log_file = 'test.log'
+log_path = os.path.join(BASE_LOG_DIR, log_file)
+add_file_logger(log_path)
+
+
+def _clean_base_log_dir():
+        # clean the current test log dir
+        for f in os.listdir(BASE_LOG_DIR):
+            if f == 'test.log':
+                with open(os.path.join(BASE_LOG_DIR, f), 'wb'):
+                    pass
+                continue
+            file_path = os.path.join(BASE_LOG_DIR, f)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+
+
+def clear_current_test(func):
+    def wrapper(*args, **kwargs):
+        # clean base log dir
+        _clean_base_log_dir()
+        # execute the wrapped function
+        with open(os.path.join(BASE_LOG_DIR, func.__name__), 'wt'):
+            pass
+        res = func(*args, **kwargs)
+        # clean base log dir again...
+        _clean_base_log_dir()
+        # return wrapped function's output
+        return res
+    return wrapper

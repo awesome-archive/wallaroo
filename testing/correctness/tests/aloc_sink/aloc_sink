@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+
+# NOTES:
+#
+# 1. This server will truncate the out_path & out_path+".txnlog" files.
+#    If you want to preserve their data, then move them out of the way
+#    before starting this server.
+
+import asyncore
+import logging
+import sys
+
+from aloc_sink_impl import ThreadSafeDict, SinkServer, TwoPC_Output_LocalFilesystem
+
+fmt = '%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s'
+logging.root.formatter = logging.Formatter(fmt)
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.root.formatter)
+logging.root.addHandler(stream_handler)
+logging.root.setLevel(logging.INFO)
+#logging.root.setLevel(logging.DEBUG)
+
+out_path = sys.argv[1]
+abort_rule_path = sys.argv[2]
+listen_port = int(sys.argv[3])
+try:
+    s3_scheme = sys.argv[4]
+    s3_bucket = sys.argv[5]
+    s3_prefix = sys.argv[6]
+    logging.debug("s3_scheme: {}, s3_bucket: {}, s3_prefix: {}".format(s3_scheme, s3_bucket, s3_prefix))
+except:
+    s3_scheme = None
+    s3_bucket = None
+    s3_prefix = None
+make_twopc_output = lambda: TwoPC_Output_LocalFilesystem(out_path)
+
+logging.debug("out_path: {}".format(out_path))
+logging.debug("abort_rule_path: {}".format(abort_rule_path))
+server = SinkServer('127.0.0.1', listen_port, out_path, abort_rule_path, s3_scheme, s3_bucket, s3_prefix,
+                    make_twopc_output)
+logging.debug("server: {}".format(server))
+logging.debug("asyncore file: {}".format(asyncore.__file__))
+logging.info("Process started")
+asyncore.loop(timeout=0.001)

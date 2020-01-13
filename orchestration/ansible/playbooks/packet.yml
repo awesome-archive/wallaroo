@@ -64,8 +64,16 @@
     become: yes
   - name: sysctl speed change for raid build
     sysctl:
+      name: dev.raid.speed_limit_max
+      value: 2000000000
+      state: present
+      sysctl_set: yes
+      reload: yes
+    become: yes
+  - name: sysctl speed change for raid build
+    sysctl:
       name: dev.raid.speed_limit_min
-      value: 30720
+      value: 2000000000
       state: present
       sysctl_set: yes
       reload: yes
@@ -87,7 +95,7 @@
         components: "{{ disks_list }}"
         filesystem_type: "{{ raid_fs if raid_fs is defined else 'ext4' }}"
         mount_point: "/data"
-        mount_options: "noatime,noexec,nodiratime"
+        mount_options: "noatime,nodiratime,discard"
         dump: 0
         passno: 0
   roles:
@@ -97,8 +105,6 @@
 
 # Configure and deploy leader servers.
 - hosts: wallaroo-leaders
-  vars_files:
-    - 'docker_creds.yml'
   vars:
     ethernet_interface: "{{ ansible_default_ipv4.interface }}"
     ptpd_role: master
@@ -113,8 +119,6 @@
 
 # Configure and deploy follower servers.
 - hosts: wallaroo-followers
-  vars_files:
-    - 'docker_creds.yml'
   vars:
     ethernet_interface: "{{ ansible_default_ipv4.interface }}"
     ptpd_role: slave

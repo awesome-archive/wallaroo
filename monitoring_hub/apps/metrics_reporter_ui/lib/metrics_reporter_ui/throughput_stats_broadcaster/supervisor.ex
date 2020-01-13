@@ -8,19 +8,21 @@ defmodule MetricsReporterUI.ThroughputStatsBroadcaster.Supervisor do
     Supervisor.start_link(__MODULE__, [], name: @name)
   end
 
-  def start_worker([log_name: _log_name, interval_key: interval_key,
-    pipeline_key: _pipeline_key, app_name: _app_name, category: _category, stats_interval: _stats_interval] = args) do
-    Supervisor.start_child(@name, [args])    
+  def start_worker([log_name: _log_name, interval_key: _interval_key,
+    pipeline_key: _pipeline_key, app_name: _app_name, category: _category,
+    stats_interval: _stats_interval, msg_timestamp: _msg_timestamp] = args) do
+    Supervisor.start_child(@name, [args])
   end
 
   def find_or_start_worker([log_name: log_name, interval_key: interval_key,
-    pipeline_key: _pipeline_key, app_name: _app_name, category: _category, stats_interval: _stats_interval] = args) do
+    pipeline_key: _pipeline_key, app_name: _app_name, category: _category,
+    stats_interval: _stats_interval, msg_timestamp: _msg_timestamp] = args) do
     case :gproc.where({:n, :l, {:tsb_worker, message_log_name(log_name, interval_key)}}) do
       :undefined ->
         start_worker(args)
       pid ->
         {:ok, pid}
-    end  
+    end
   end
 
   def init([]) do

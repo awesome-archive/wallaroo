@@ -32,27 +32,36 @@ use "collections"
 use "net"
 use "time"
 use "wallaroo/core/boundary"
+use "wallaroo/core/checkpoint"
 use "wallaroo/core/common"
-use "wallaroo/ent/data_receiver"
-use "wallaroo/ent/network"
-use "wallaroo/ent/watermarking"
-use "wallaroo_labs/mort"
+use "wallaroo/core/sink"
+use "wallaroo/core/barrier"
+use "wallaroo/core/data_receiver"
 use "wallaroo/core/initialization"
 use "wallaroo/core/invariant"
 use "wallaroo/core/messages"
 use "wallaroo/core/metrics"
+use "wallaroo/core/network"
+use "wallaroo/core/recovery"
 use "wallaroo/core/routing"
 use "wallaroo/core/topology"
+use "wallaroo_labs/logging"
+use "wallaroo_labs/mort"
+use "wallaroo_labs/time"
 
 use @pony_asio_event_create[AsioEventID](owner: AsioEventNotify, fd: U32,
-  flags: U32, nsec: U64, noisy: Bool, auto_resub: Bool)
+  flags: U32, nsec: U64, noisy: Bool)
 use @pony_asio_event_fd[U32](event: AsioEventID)
 use @pony_asio_event_unsubscribe[None](event: AsioEventID)
 use @pony_asio_event_resubscribe_read[None](event: AsioEventID)
 use @pony_asio_event_resubscribe_write[None](event: AsioEventID)
 use @pony_asio_event_destroy[None](event: AsioEventID)
 
-actor TCPSink is Consumer
+use @l[I32](severity: LogSeverity, category: LogCategory, fmt: Pointer[U8] tag, ...)
+use @ll[I32](sev_cat: U16, fmt: Pointer[U8] tag, ...)
+
+
+actor TCPSink is Sink
   """
   # TCPSink
 
@@ -70,14 +79,20 @@ actor TCPSink is Consumer
 
   ## Possible future work
 
-  - Much better algo for determining how many credits to hand out per producer
   - At the moment we treat sending over TCP as done. In the future we can and
     should support ack of the data being handled from the other side.
-  - Handle reconnecting after being disconnected from the downstream
   - Optional in sink deduplication (this woud involve storing what we sent and
     was acknowleged.)
   """
+  let _env: Env
+  var _phase: SinkPhase = InitialSinkPhase
+  let _barrier_coordinator: BarrierCoordinator
+  let _checkpoint_initiator: CheckpointInitiator
   // Steplike
+  let _sink_id: RoutingId
+  let _event_log: EventLog
+  let _recovering: Bool
+  let _name: String
   let _encoder: TCPEncoderWrapper
   let _wb: Writer = Writer
   let _metrics_reporter: MetricsReporter
@@ -85,10 +100,14 @@ actor TCPSink is Consumer
 
   // Consumer
   var _upstreams: SetIs[Producer] = _upstreams.create()
+  // _inputs keeps track of all inputs by step id. There might be
+  // duplicate producers in this map (unlike _upstreams) since there might be
+  // multiple upstream step ids over a boundary
+  let _inputs: Map[RoutingId, Producer] = _inputs.create()
   var _mute_outstanding: Bool = false
 
   // TCP
-  var _notify: WallarooOutgoingNetworkActorNotify
+  var _notify: TCPSinkNotify
   var _read_buf: Array[U8] iso
   var _next_size: USize
   let _max_size: USize
@@ -120,24 +139,35 @@ actor TCPSink is Consumer
   var _service: String
   var _from: String
 
+  let _asio_flags: U32 = AsioEvent.read_write_oneshot()
+
   // Producer (Resilience)
   let _timers: Timers = Timers
 
-  let _terminus_route: TerminusRoute = TerminusRoute
+  var _seq_id: SeqId = 0
 
-  new create(encoder_wrapper: TCPEncoderWrapper,
-    metrics_reporter: MetricsReporter iso, host: String, service: String,
-    initial_msgs: Array[Array[ByteSeq] val] val,
+  new create(sink_id: RoutingId, sink_name: String, event_log: EventLog,
+    recovering: Bool, env: Env, encoder_wrapper: TCPEncoderWrapper,
+    metrics_reporter: MetricsReporter iso,
+    barrier_coordinator: BarrierCoordinator, checkpoint_initiator: CheckpointInitiator,
+    host: String, service: String, initial_msgs: Array[Array[ByteSeq] val] val,
     from: String = "", init_size: USize = 64, max_size: USize = 16384,
-    reconnect_pause: U64 = 10_000_000_000)
+    reconnect_pause: U64 = 250_000_000 /**10_000_000_000**/)
   =>
     """
     Connect via IPv4 or IPv6. If `from` is a non-empty string, the connection
     will be made from the specified interface.
     """
+    _env = env
+    _sink_id = sink_id
+    _name = sink_name
+    _event_log = event_log
+    _recovering = recovering
     _encoder = encoder_wrapper
     _metrics_reporter = consume metrics_reporter
-    _read_buf = recover Array[U8].undefined(init_size) end
+    _barrier_coordinator = barrier_coordinator
+    _checkpoint_initiator = checkpoint_initiator
+    _read_buf = recover Array[U8].>undefined(init_size) end
     _next_size = init_size
     _max_size = max_size
     _notify = TCPSinkNotify
@@ -147,7 +177,13 @@ actor TCPSink is Consumer
     _service = service
     _from = from
     _connect_count = 0
+    _phase = NormalSinkPhase(this)
     _mute_upstreams()
+
+    ifdef "identify_routing_ids" then
+      @l(Log.info(), Log.tcp_sink(), "===TCPSink %s created===\n".cstring(),
+        _sink_id.string().cstring())
+    end
 
   //
   // Application Lifecycle events
@@ -157,9 +193,7 @@ actor TCPSink is Consumer
     _initializer = initializer
     initializer.report_created(this)
 
-  be application_created(initializer: LocalTopologyInitializer,
-    omni_router: OmniRouter)
-  =>
+  be application_created(initializer: LocalTopologyInitializer) =>
     _mute_upstreams()
     initializer.report_initialized(this)
 
@@ -169,39 +203,51 @@ actor TCPSink is Consumer
   be application_ready_to_work(initializer: LocalTopologyInitializer) =>
     None
 
+  be cluster_ready_to_work(initializer: LocalTopologyInitializer) =>
+    None
+
   fun ref _initial_connect() =>
-    @printf[I32]("TCPSink initializing connection to %s:%s\n".cstring(),
+    @l(Log.info(), Log.tcp_sink(), "TCPSink initializing connection to %s:%s\n".cstring(),
       _host.cstring(), _service.cstring())
     _connect_count = @pony_os_connect_tcp[U32](this,
       _host.cstring(), _service.cstring(),
-      _from.cstring())
+      _from.cstring(), _asio_flags)
     _notify_connecting()
 
   // open question: how do we reconnect if our external system goes away?
   be run[D: Any val](metric_name: String, pipeline_time_spent: U64, data: D,
+    key: Key, event_ts: U64, watermark_ts: U64, i_producer_id: RoutingId,
     i_producer: Producer, msg_uid: MsgId, frac_ids: FractionalMessageId,
-    i_seq_id: SeqId, i_route_id: RouteId,
+    i_seq_id: SeqId, latest_ts: U64, metrics_id: U16, worker_ingress_ts: U64)
+  =>
+    _phase.process_message[D](metric_name, pipeline_time_spent,
+      data, key, event_ts, watermark_ts, i_producer_id, i_producer, msg_uid,
+      frac_ids, i_seq_id, latest_ts, metrics_id, worker_ingress_ts)
+
+  fun ref process_message[D: Any val](metric_name: String,
+    pipeline_time_spent: U64, data: D, key: Key, event_ts: U64,
+    watermark_ts: U64, i_producer_id: RoutingId, i_producer: Producer,
+    msg_uid: MsgId, frac_ids: FractionalMessageId, i_seq_id: SeqId,
     latest_ts: U64, metrics_id: U16, worker_ingress_ts: U64)
   =>
     var receive_ts: U64 = 0
     ifdef "detailed-metrics" then
-      receive_ts = Time.nanos()
+      receive_ts = WallClock.nanoseconds()
       _metrics_reporter.step_metric(metric_name, "Before receive at sink",
         9998, latest_ts, receive_ts)
     end
 
     ifdef "trace" then
-      @printf[I32]("Rcvd msg at TCPSink\n".cstring())
+      @l(Log.debug(), Log.tcp_sink(), "Rcvd msg at TCPSink\n".cstring())
     end
     try
-      let encoded = _encoder.encode[D](data, _wb)
-
-      let next_tracking_id = _next_tracking_id(i_producer, i_route_id, i_seq_id)
-      _writev(encoded, next_tracking_id)
+      let encoded = _encoder.encode[D](data, _wb)?
+      let next_seq_id = (_seq_id = _seq_id + 1)
+      _writev(encoded, next_seq_id)
 
       // TODO: Should happen when tracking info comes back from writev as
       // being done.
-      let end_ts = Time.nanos()
+      let end_ts = WallClock.nanoseconds()
       let time_spent = end_ts - worker_ingress_ts
 
       ifdef "detailed-metrics" then
@@ -218,33 +264,11 @@ actor TCPSink is Consumer
 
     _maybe_mute_or_unmute_upstreams()
 
-  fun ref _next_tracking_id(i_producer: Producer, i_route_id: RouteId,
-    i_seq_id: SeqId): (U64 | None)
-  =>
-    ifdef "resilience" then
-      return _terminus_route.terminate(i_producer, i_route_id, i_seq_id)
-    end
-
-    None
-
-  be replay_run[D: Any val](metric_name: String, pipeline_time_spent: U64,
-    data: D, i_producer: Producer, msg_uid: MsgId, frac_ids: FractionalMessageId,
-    i_seq_id: SeqId, i_route_id: RouteId,
-    latest_ts: U64, metrics_id: U16, worker_ingress_ts: U64)
-  =>
-    //TODO: deduplication like in the Step <- this is pointless if the Sink
-    //doesn't have state, because on recovery we won't have a list of "seen
-    //messages", which we would normally get from the eventlog.
-    run[D](metric_name, pipeline_time_spent, data, i_producer, msg_uid, frac_ids,
-      i_seq_id, i_route_id, latest_ts, metrics_id, worker_ingress_ts)
-
   be update_router(router: Router) =>
     """
     No-op: TCPSink has no router
     """
     None
-
-  be receive_state(state: ByteSeq val) => Fail()
 
   be dispose() =>
     """
@@ -252,53 +276,129 @@ actor TCPSink is Consumer
     to be sent but any writes that arrive after this will be
     silently discarded and not acknowleged.
     """
-    @printf[I32]("Shutting down TCPSink\n".cstring())
+    @l(Log.info(), Log.tcp_sink(), "Shutting down TCPSink\n".cstring())
     _no_more_reconnect = true
     _timers.dispose()
     close()
     _notify.dispose()
 
-  fun ref _unit_finished(number_finished: ISize,
-    number_tracked_finished: ISize,
-    tracking_id: (SeqId | None))
-  =>
-    """
-    Handles book keeping related to resilience. Called when
-    a collection of sends is completed. When backpressure hasn't been applied,
-    this would be called for each send. When backpressure has been applied and
-    there is pending work to send, this would be called once after we finish
-    attempting to catch up on sending pending data.
-    """
-    ifdef debug then
-      Invariant(number_finished > 0)
-      Invariant(number_tracked_finished <= number_finished)
-    end
-    ifdef "trace" then
-      @printf[I32]("Sent %d msgs over sink\n".cstring(), number_finished)
+  fun inputs(): Map[RoutingId, Producer] box =>
+    _inputs
+
+  be register_producer(id: RoutingId, producer: Producer) =>
+    // If we have at least one input, then we are involved in checkpointing.
+    if _inputs.size() == 0 then
+      _barrier_coordinator.register_sink(this)
+      _checkpoint_initiator.register_sink(this)
+      _event_log.register_resilient(_sink_id, this)
     end
 
-    ifdef "resilience" then
-      match tracking_id
-      | let sent: SeqId =>
-        _terminus_route.receive_ack(sent)
+    _inputs(id) = producer
+    _upstreams.set(producer)
+
+  be unregister_producer(id: RoutingId, producer: Producer) =>
+    if _inputs.contains(id) then
+      try
+        _inputs.remove(id)?
+      else
+        Fail()
+      end
+
+      var have_input = false
+      for i in _inputs.values() do
+        if i is producer then have_input = true end
+      end
+      if not have_input then
+        _upstreams.unset(producer)
+      end
+
+      // If we have no inputs, then we are not involved in checkpointing.
+      if _inputs.size() == 0 then
+        _barrier_coordinator.unregister_sink(this)
+        _checkpoint_initiator.unregister_sink(this)
+        _event_log.unregister_resilient(_sink_id, this)
       end
     end
 
-  be request_ack() =>
-    _terminus_route.request_ack()
+  be report_status(code: ReportStatusCode) =>
+    None
 
-  be register_producer(producer: Producer) =>
-    _upstreams.set(producer)
+  ///////////////
+  // BARRIER
+  ///////////////
+  be receive_barrier(input_id: RoutingId, producer: Producer,
+    barrier_token: BarrierToken)
+  =>
+    @l(Log.debug(), Log.tcp_sink(), "Receive barrier %s at TCPSink %s\n".cstring(), barrier_token.string().cstring(), _sink_id.string().cstring())
+    process_barrier(input_id, producer, barrier_token)
 
-  be unregister_producer(producer: Producer) =>
-    ifdef debug then
-      Invariant(_upstreams.contains(producer))
+  fun ref receive_new_barrier(input_id: RoutingId, producer: Producer,
+    barrier_token: BarrierToken)
+  =>
+    _phase = BarrierSinkPhase(_sink_id, this,
+      barrier_token)
+    _phase.receive_barrier(input_id, producer,
+      barrier_token)
+
+  fun ref process_barrier(input_id: RoutingId, producer: Producer,
+    barrier_token: BarrierToken)
+  =>
+    match barrier_token
+    | let srt: CheckpointRollbackBarrierToken =>
+      _phase.prepare_for_rollback(barrier_token)
     end
 
-    _upstreams.unset(producer)
+    _phase.receive_barrier(input_id, producer,
+      barrier_token)
 
-  //
+  fun ref barrier_complete(barrier_token: BarrierToken) =>
+    @l(Log.debug(), Log.tcp_sink(), "Barrier %s complete at TCPSink %s\n".cstring(), barrier_token.string().cstring(), _sink_id.string().cstring())
+    _barrier_coordinator.ack_barrier(this, barrier_token)
+    match barrier_token
+    | let sbt: CheckpointBarrierToken =>
+      checkpoint_state(sbt.id)
+    end
+    let queued = _phase.queued()
+    _phase = NormalSinkPhase(this)
+    for q in queued.values() do
+      match q
+      | let qm: QueuedMessage =>
+        qm.process_message(this)
+      | let qb: QueuedBarrier =>
+        qb.inject_barrier(this)
+      end
+    end
+
+  be checkpoint_complete(checkpoint_id: CheckpointId) =>
+    None
+
+  ///////////////
+  // CHECKPOINTS
+  ///////////////
+  fun ref checkpoint_state(checkpoint_id: CheckpointId) =>
+    """
+    TCPSinks don't currently write out any data as part of the checkpoint.
+    """
+    _event_log.checkpoint_state(_sink_id, checkpoint_id,
+      recover val Array[ByteSeq] end)
+
+  be prepare_for_rollback() =>
+    finish_preparing_for_rollback()
+
+  fun ref finish_preparing_for_rollback() =>
+    _phase = NormalSinkPhase(this)
+
+  be rollback(payload: ByteSeq val, event_log: EventLog,
+    checkpoint_id: CheckpointId)
+  =>
+    """
+    There is nothing for a TCPSink to rollback to.
+    """
+    event_log.ack_rollback(_sink_id)
+
+  ///////////////
   // TCP
+  ///////////////
   be _event_notify(event: AsioEventID, flags: U32, arg: U32) =>
     """
     Handle socket events.
@@ -317,6 +417,7 @@ actor TCPSink is Consumer
             _event = event
             _connected = true
             _writeable = true
+            _readable = true
 
             match _initializer
             | let initializer: LocalTopologyInitializer =>
@@ -327,6 +428,7 @@ actor TCPSink is Consumer
             end
 
             _notify.connected(this)
+            _pending_reads()
 
             for msg in _initial_msgs.values() do
               _writev(msg, None)
@@ -345,7 +447,7 @@ actor TCPSink is Consumer
             _notify_connecting()
           end
         elseif not _connected and _closed then
-          @printf[I32]("Reconnection asio event\n".cstring())
+          @l(Log.info(), Log.tcp_sink(), "Reconnection asio event\n".cstring())
           if @pony_os_connected[Bool](fd) then
             // The connection was successful, make it ours.
             _fd = fd
@@ -357,12 +459,14 @@ actor TCPSink is Consumer
 
             _connected = true
             _writeable = true
+            _readable = true
 
             _closed = false
             _shutdown = false
             _shutdown_peer = false
 
             _notify.connected(this)
+            _pending_reads()
 
             ifdef not windows then
               if _pending_writes() then
@@ -425,7 +529,7 @@ actor TCPSink is Consumer
 
     var data_size: USize = 0
     for bytes in _notify.sentv(this, data).values() do
-      _pending_writev.push(bytes.cpointer().usize()).push(bytes.size())
+      _pending_writev.>push(bytes.cpointer().usize()).>push(bytes.size())
       _pending_writev_total = _pending_writev_total + bytes.size()
       _pending.push((bytes, 0))
       data_size = data_size + bytes.size()
@@ -448,7 +552,7 @@ actor TCPSink is Consumer
     everything was written. On an error, close the connection. This is for
     data that has already been transformed by the notifier.
     """
-    _pending_writev.push(data.cpointer().usize()).push(data.size())
+    _pending_writev.>push(data.cpointer().usize()).>push(data.size())
     _pending_writev_total = _pending_writev_total + data.size()
     ifdef "resilience" then
       match tracking_id
@@ -527,10 +631,8 @@ actor TCPSink is Consumer
     _pending_writev_total = 0
     _readable = false
     _writeable = false
-    ifdef linux then
-      AsioEvent.set_readable(_event, false)
-      AsioEvent.set_writeable(_event, false)
-    end
+    @pony_asio_event_set_readable[None](_event, false)
+    @pony_asio_event_set_writeable[None](_event, false)
 
     @pony_os_socket_close[None](_fd)
     _fd = -1
@@ -562,15 +664,11 @@ actor TCPSink is Consumer
         | 0 =>
           // Would block, try again later.
           _readable = false
-          ifdef linux then
-            // this is safe because asio thread isn't currently subscribed
-            // for a read event so will not be writing to the readable flag
-            AsioEvent.set_readable(_event, false)
-            _readable = false
-            @pony_asio_event_resubscribe_read(_event)
-          else
-            _readable = false
-          end
+          // this is safe because asio thread isn't currently subscribed
+          // for a read event so will not be writing to the readable flag
+          @pony_asio_event_set_readable[None](_event, false)
+          _readable = false
+          @pony_asio_event_resubscribe_read(_event)
           return
         | _next_size =>
           // Increase the read buffer size.
@@ -611,6 +709,12 @@ actor TCPSink is Consumer
       _schedule_reconnect()
     end
 
+  be _write_again() =>
+    """
+    Resume writing.
+    """
+    _pending_writes()
+
   fun ref _pending_writes(): Bool =>
     """
     Send pending data. If any data can't be sent, keep it and mark as not
@@ -629,6 +733,15 @@ actor TCPSink is Consumer
     end
 
     while _writeable and not _shutdown_peer and (_pending_writev_total > 0) do
+      // yield if we sent max bytes
+      if bytes_sent > _max_size then
+        // do tracking finished stuff
+        _tracking_finished(bytes_sent)
+
+        _write_again()
+        return false
+      end
+
       try
         //determine number of bytes and buffers to send
         if (_pending_writev.size()/2) < writev_batch_size then
@@ -640,7 +753,7 @@ actor TCPSink is Consumer
           num_to_send = writev_batch_size
           bytes_to_send = 0
           for d in Range[USize](1, num_to_send*2, 2) do
-            bytes_to_send = bytes_to_send + _pending_writev(d)
+            bytes_to_send = bytes_to_send + _pending_writev(d)?
           end
         end
 
@@ -653,17 +766,17 @@ actor TCPSink is Consumer
 
         if len < bytes_to_send then
           while len > 0 do
-            let iov_p = _pending_writev(0)
-            let iov_s = _pending_writev(1)
+            let iov_p = _pending_writev(0)?
+            let iov_s = _pending_writev(1)?
             if iov_s <= len then
               len = len - iov_s
-              _pending_writev.shift()
-              _pending_writev.shift()
-              _pending.shift()
+              _pending_writev.shift()?
+              _pending_writev.shift()?
+              _pending.shift()?
               _pending_writev_total = _pending_writev_total - iov_s
             else
-              _pending_writev.update(0, iov_p+len)
-              _pending_writev.update(1, iov_s-len)
+              _pending_writev.update(0, iov_p+len)?
+              _pending_writev.update(1, iov_s-len)?
               _pending_writev_total = _pending_writev_total - len
               len = 0
             end
@@ -681,9 +794,9 @@ actor TCPSink is Consumer
             return true
           else
            for d in Range[USize](0, num_to_send, 1) do
-             _pending_writev.shift()
-             _pending_writev.shift()
-             _pending.shift()
+             _pending_writev.shift()?
+             _pending_writev.shift()?
+             _pending.shift()?
            end
 
           end
@@ -700,14 +813,7 @@ actor TCPSink is Consumer
 
     false
 
-
   fun ref _tracking_finished(num_bytes_sent: USize) =>
-    """
-    Call _unit_finished with:
-      number of sent messages,
-      number of tracked messages sent
-      last tracking_id
-    """
     ifdef "resilience" then
       var num_sent: ISize = 0
       var tracked_sent: ISize = 0
@@ -716,12 +822,12 @@ actor TCPSink is Consumer
 
       try
         while bytes_sent > 0 do
-          let node = _pending_tracking.head()
-          (let bytes, let tracking_id) = node()
+          let node = _pending_tracking.head()?
+          (let bytes, let tracking_id) = node()?
           if bytes <= bytes_sent then
             num_sent = num_sent + 1
             bytes_sent = bytes_sent - bytes
-            _pending_tracking.shift()
+            _pending_tracking.shift()?
             match tracking_id
             | let id: SeqId =>
               tracked_sent = tracked_sent + 1
@@ -731,12 +837,8 @@ actor TCPSink is Consumer
             let bytes_remaining = bytes - bytes_sent
             bytes_sent = 0
             // update remaining for this message
-            node() = (bytes_remaining, tracking_id)
+            node()? = (bytes_remaining, tracking_id)
           end
-        end
-
-        if num_sent > 0 then
-          _unit_finished(num_sent, tracked_sent, final_pending_sent)
         end
       end
     end
@@ -751,11 +853,11 @@ actor TCPSink is Consumer
       _read_buf.undefined(_next_size)
     end
 
-  fun local_address(): IPAddress =>
+  fun local_address(): NetAddress =>
     """
     Return the local IP address.
     """
-    let ip = recover IPAddress end
+    let ip = recover NetAddress end
     @pony_os_sockname[Bool](_fd, ip)
     ip
 
@@ -779,7 +881,7 @@ actor TCPSink is Consumer
 
   fun ref _schedule_reconnect() =>
     if (_host != "") and (_service != "") and not _no_more_reconnect then
-      @printf[I32]("RE-Connecting TCPSink to %s:%s\n".cstring(),
+      @l(Log.info(), Log.tcp_sink(), "RE-Connecting TCPSink to %s:%s\n".cstring(),
                    _host.cstring(), _service.cstring())
       let timer = Timer(PauseBeforeReconnectTCPSink(this), _reconnect_pause)
       _timers(consume timer)
@@ -789,23 +891,21 @@ actor TCPSink is Consumer
     if not _connected and not _no_more_reconnect then
       _connect_count = @pony_os_connect_tcp[U32](this,
         _host.cstring(), _service.cstring(),
-        _from.cstring())
+        _from.cstring(), _asio_flags)
       _notify_connecting()
     end
 
   fun ref _apply_backpressure() =>
     if not _throttled then
       _throttled = true
-      _writeable = false
-      ifdef linux then
-        // this is safe because asio thread isn't currently subscribed
-        // for a write event so will not be writing to the readable flag
-        AsioEvent.set_writeable(_event, false)
-        @pony_asio_event_resubscribe_write(_event)
-      end
       _notify.throttled(this)
-      _maybe_mute_or_unmute_upstreams()
     end
+    _writeable = false
+    // this is safe because asio thread isn't currently subscribed
+    // for a write event so will not be writing to the readable flag
+    @pony_asio_event_set_writeable[None](_event, false)
+    @pony_asio_event_resubscribe_write(_event)
+    _maybe_mute_or_unmute_upstreams()
 
   fun ref _release_backpressure() =>
     if _throttled then
@@ -872,14 +972,14 @@ class TCPSinkNotify is WallarooOutgoingNetworkActorNotify
     None
 
   fun ref connected(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[I32]("TCPSink connected\n".cstring())
+    @l(Log.info(), Log.tcp_sink(), "TCPSink connected\n".cstring())
 
 
   fun ref closed(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[I32]("TCPSink connection closed\n".cstring())
+    @l(Log.info(), Log.tcp_sink(), "TCPSink connection closed\n".cstring())
 
   fun ref connect_failed(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[I32]("TCPSink connection failed\n".cstring())
+    @l(Log.info(), Log.tcp_sink(), "TCPSink connection failed\n".cstring())
 
   fun ref sentv(conn: WallarooOutgoingNetworkActor ref,
     data: ByteSeqIter): ByteSeqIter
@@ -895,10 +995,10 @@ class TCPSinkNotify is WallarooOutgoingNetworkActorNotify
     qty
 
   fun ref throttled(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[None]("TCPSink is experiencing back pressure\n".cstring())
+    @l(Log.info(), Log.tcp_sink(), "TCPSink is experiencing back pressure\n".cstring())
 
   fun ref unthrottled(conn: WallarooOutgoingNetworkActor ref) =>
-    @printf[None](("TCPSink is no longer experiencing" +
+    @l(Log.info(), Log.tcp_sink(), ("TCPSink is no longer experiencing" +
       " back pressure\n").cstring())
 
 class PauseBeforeReconnectTCPSink is TimerNotify

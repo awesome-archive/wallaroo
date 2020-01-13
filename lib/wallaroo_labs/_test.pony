@@ -29,10 +29,14 @@ use "ponytest"
 use bytes = "bytes"
 use container_queue = "container_queue"
 use fix = "fix"
+use math = "math"
 use messages = "messages"
 use options = "options"
 use queue = "queue"
 use weighted = "weighted"
+use query = "query"
+use cwm = "connector_wire_messages"
+use logging = "logging"
 
 actor Main is TestList
   new create(env: Env) =>
@@ -45,7 +49,11 @@ actor Main is TestList
     bytes.Main.make().tests(test)
     container_queue.Main.make().tests(test)
     fix.Main.make().tests(test)
+    math.Main.make().tests(test)
     messages.Main.make().tests(test)
     options.Main.make().tests(test)
     queue.Main.make().tests(test)
     weighted.Main.make().tests(test)
+    query.Main.make().tests(test)
+    cwm.Main.make().tests(test)
+    logging.Main.make().tests(test)

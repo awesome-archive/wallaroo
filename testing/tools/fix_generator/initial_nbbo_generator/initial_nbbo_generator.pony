@@ -1,12 +1,18 @@
 /*
 
-Copyright 2017 The Wallaroo Authors.
+Copyright 2018 The Wallaroo Authors.
 
-Licensed as a Wallaroo Enterprise file under the Wallaroo Community
-License (the "License"); you may not use this file except in compliance with
-the License. You may obtain a copy of the License at
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
 
-     https://github.com/wallaroolabs/wallaroo/blob/master/LICENSE
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ implied. See the License for the specific language governing
+ permissions and limitations under the License.
 
 */
 
@@ -17,6 +23,7 @@ use "collections"
 use "debug"
 use "wallaroo_labs/fix"
 use "wallaroo_labs/fix_generator_utils"
+use "wallaroo_labs/mort"
 use "random"
 use "time"
 
@@ -59,9 +66,9 @@ actor Main
       let auth = env.root as AmbientAuth
 
       let nonrejected_symbols_file =
-        File(FilePath(auth, symbols_file_path))
+        File(FilePath(auth, symbols_file_path)?)
       let rejected_symbols_file =
-        File(FilePath(auth, rejected_symbols_file_path))
+        File(FilePath(auth, rejected_symbols_file_path)?)
       let rejected_instruments =
         generate_instruments(rejected_symbols_file)
       let nonrejected_instruments =
@@ -92,7 +99,7 @@ actor Main
         is_header = false
         continue
       end
-      match InstrumentParser(line)
+      match InstrumentParser(consume line)
       | let instrument: InstrumentData val =>
         instruments.push(instrument)
       end
@@ -108,7 +115,7 @@ actor InitialNbboFileGenerator
   let _time: (I64 val, I64 val) = Time.now()
   var _rejected_instruments: Array[InstrumentData val] val
   var _nonrejected_instruments: Array[InstrumentData val] val
-  var _utc_timestamp: String
+  var _utc_timestamp: String = "0"
 
 
   new create(env: Env,
@@ -122,8 +129,12 @@ actor InitialNbboFileGenerator
     _output_file_path = output_file_path
     _rejected_instruments = rejected_instruments
     _nonrejected_instruments = nonrejected_instruments
-    let date = Date(_time._1, _time._2)
-    _utc_timestamp = date.format("%Y%m%d-%H:%M:%S.000")
+    let date = PosixDate(_time._1, _time._2)
+    try
+      _utc_timestamp = date.format("%Y%m%d-%H:%M:%S.000")?
+    else
+      Fail()
+    end
 
   be generate_and_write() =>
     generate_nbbo_messages(_rejected_instruments, true)
@@ -143,7 +154,7 @@ actor InitialNbboFileGenerator
 
   be write_to_file() =>
     try
-      let output_file = File(FilePath(_auth, _output_file_path))
+      let output_file = File(FilePath(_auth, _output_file_path)?)
       output_file.set_length(0)
       output_file.writev(_wb.done())
     end

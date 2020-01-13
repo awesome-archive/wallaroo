@@ -1,0 +1,396 @@
+version: 2.1
+executors:
+  wallaroo-ci:
+    docker:
+      - image: wallaroolabs/wallaroo-ci:2019.06.09.1
+  pony-changelog:
+    docker:
+      - image: ponylang/changelog-tool:release
+jobs:
+  verify-changelog:
+    executor: pony-changelog
+    steps:
+      - checkout
+      - run: changelog-tool verify
+
+  unit-tests:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: make unit-tests debug=true
+
+  integration-tests:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: make integration-tests-lib-all debug=true
+      - run: make integration-tests-demos-all debug=true
+      - run: make integration-tests-examples-all debug=true
+      - run: make integration-tests-giles-all debug=true
+      - run: make integration-tests-monitoring_hub-all debug=true
+      - run: make integration-tests-utils-all debug=true
+      - run: make integration-tests-testing-tools-all debug=true
+      - run: make integration-tests-testing-performance-all debug=true
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  integration-tests-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: make integration-tests-demos-all debug=true resilience=on
+      - run: make integration-tests-examples-all debug=true resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  integration-tests-testing-correctness-apps:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: make integration-tests-testing-correctness-apps-all debug=true
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  integration-tests-testing-correctness-apps-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: make integration-tests-testing-correctness-apps-all debug=true resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  integration-tests-testing-correctness-tests-aloc_sink:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: make integration-tests-testing-correctness-tests-aloc_sink debug=true resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  autoscale-tests-pony:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k autoscale_pony'
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  autoscale-tests-pony-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k autoscale_pony' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  autoscale-tests-python2:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k autoscale_python2'
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  autoscale-tests-python2-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k autoscale_python2' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  autoscale-tests-python3:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k autoscale_python3'
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  autoscale-tests-python3-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k autoscale_python3' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  resilience-tests-pony:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k resilience_pony' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  resilience-tests-python2:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k resilience_python2' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  resilience-tests-python3:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k system_events -k resilience_python3' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  topology-tests-python2:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k topology -k python2'
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  topology-tests-python2-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k topology -k python2' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  topology-tests-python3:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k topology -k python3'
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  topology-tests-python3-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k topology -k python3' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  window-policy-tests:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k window_policy'
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  window-policy-tests-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k window_policy' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  cli-tests:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k cli'
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+  cli-tests-with-resilience:
+    executor: wallaroo-ci
+    steps:
+      - checkout
+      - run: |
+          ulimit -c unlimited
+          ulimit -a
+          make integration-tests-testing-conformance-all debug=true pytest_exp='-k cli' resilience=on
+      - store_artifacts:
+          path: /tmp/wallaroo_test_errors
+
+workflows:
+  version: 2
+  test:
+    jobs:
+      # must pass first
+      - verify-changelog
+      - unit-tests
+
+      - integration-tests:
+          requires:
+            - unit-tests
+
+      - integration-tests-with-resilience:
+          requires:
+            - unit-tests
+
+      - integration-tests-testing-correctness-apps:
+          requires:
+            - unit-tests
+
+      - integration-tests-testing-correctness-apps-with-resilience:
+          requires:
+            - unit-tests
+
+      - integration-tests-testing-correctness-tests-aloc_sink:
+          requires:
+            - unit-tests
+
+      - cli-tests:
+          requires:
+            - unit-tests
+
+      - cli-tests-with-resilience:
+          requires:
+            - unit-tests
+
+      - autoscale-tests-pony:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - autoscale-tests-pony-with-resilience:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - autoscale-tests-python2:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - autoscale-tests-python2-with-resilience:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - autoscale-tests-python3:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - autoscale-tests-python3-with-resilience:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - resilience-tests-pony:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - resilience-tests-python2:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - resilience-tests-python3:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - topology-tests-python2:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - topology-tests-python2-with-resilience:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - topology-tests-python3:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - topology-tests-python3-with-resilience:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - window-policy-tests:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience
+
+      - window-policy-tests-with-resilience:
+          requires:
+            - integration-tests
+            - integration-tests-testing-correctness-apps
+            - integration-tests-with-resilience
+            - integration-tests-testing-correctness-apps-with-resilience

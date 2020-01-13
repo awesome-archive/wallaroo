@@ -35,7 +35,9 @@ use "options"
 use "serialise"
 use "wallaroo_labs/bytes"
 use "wallaroo"
+use "wallaroo_labs/logging"
 use "wallaroo_labs/mort"
+use "wallaroo_labs/time"
 use "wallaroo/core/sink/tcp_sink"
 use "wallaroo/core/source"
 use "wallaroo/core/source/tcp_source"
@@ -46,6 +48,7 @@ primitive Pong
 
 actor Main
   new create(env: Env) =>
+    Log.set_defaults()
     var app_type: (Ping | Pong | None) = None
     var options = Options(env.args, false)
 
@@ -63,25 +66,23 @@ actor Main
     end
 
     try
-      let application =
+      let pipeline =
         recover val
           match app_type
           | Ping =>
-            Application("Ping App")
-              .new_pipeline[U8, U8]("Ping",
-                TCPSourceConfig[U8].from_options(PongDecoder,
-                  TCPSourceConfigCLIParser(env.args)(0)))
-                .to[U8]({(): Pingify => Pingify})
-                .to_sink(TCPSinkConfig[U8].from_options(PingPongEncoder,
-                  TCPSinkConfigCLIParser(env.args)(0)))
+            Wallaroo.source[U8]("Ping",
+              TCPSourceConfig[U8].from_options(PongDecoder,
+                TCPSourceConfigCLIParser("Ping", env.args)?))
+              .to[U8](Pingify)
+              .to_sink(TCPSinkConfig[U8].from_options(PingPongEncoder,
+                TCPSinkConfigCLIParser(env.args)?(0)?))
           | Pong =>
-            Application("Pong App")
-              .new_pipeline[U8, U8]("Pong",
-                TCPSourceConfig[U8].from_options(PingDecoder,
-                  TCPSourceConfigCLIParser(env.args)(0)))
-                .to[U8]({(): Pongify => Pongify})
-                .to_sink(TCPSinkConfig[U8].from_options(PingPongEncoder,
-                  TCPSinkConfigCLIParser(env.args)(0)))
+            Wallaroo.source[U8]("Pong",
+              TCPSourceConfig[U8].from_options(PingDecoder,
+                TCPSourceConfigCLIParser("Pong", env.args)?))
+              .to[U8](Pongify)
+              .to_sink(TCPSinkConfig[U8].from_options(PingPongEncoder,
+                TCPSinkConfigCLIParser(env.args)?(0)?))
           else
             @printf[I32]("Use --ping or --pong to start app.\n".cstring())
             error
@@ -91,22 +92,23 @@ actor Main
       match app_type
       | Ping =>
         @printf[I32]("Starting up as Ping\n".cstring())
+        Wallaroo.build_application(env, "Ping", pipeline)
       | Pong =>
         @printf[I32]("Starting up as Pong\n".cstring())
+        Wallaroo.build_application(env, "Pong", pipeline)
       end
-      Startup(env, application, "ping-app")
     else
       @printf[I32]("Couldn't build topology\n".cstring())
     end
 
-primitive Pingify is Computation[U8, U8]
+primitive Pingify is StatelessComputation[U8, U8]
   fun apply(input: U8): U8 =>
     @printf[I32]("Rcvd Pong -> %s\n".cstring(), input.string().cstring())
     1
 
   fun name(): String => "Pingify"
 
-primitive Pongify is Computation[U8, U8]
+primitive Pongify is StatelessComputation[U8, U8]
   fun apply(input: U8): U8 =>
     @printf[I32]("Rcvd Ping -> %s\n".cstring(), input.string().cstring())
     0
@@ -118,20 +120,20 @@ primitive PingDecoder is FramedSourceHandler[U8]
     4
 
   fun payload_length(data: Array[U8] iso): USize ? =>
-    Bytes.to_u32(data(0), data(1), data(2), data(3)).usize()
+    Bytes.to_u32(data(0)?, data(1)?, data(2)?, data(3)?).usize()
 
   fun decode(data: Array[U8] val): U8 ? =>
-    if data(0) == 1 then 1 else error end
+    if data(0)? == 1 then 1 else error end
 
 primitive PongDecoder is FramedSourceHandler[U8]
   fun header_length(): USize =>
     4
 
   fun payload_length(data: Array[U8] iso): USize ? =>
-    Bytes.to_u32(data(0), data(1), data(2), data(3)).usize()
+    Bytes.to_u32(data(0)?, data(1)?, data(2)?, data(3)?).usize()
 
   fun decode(data: Array[U8] val): U8 ? =>
-    if data(0) == 0 then 0 else error end
+    if data(0)? == 0 then 0 else error end
 
 primitive PingPongEncoder
   fun apply(byte: U8, wb: Writer): Array[ByteSeq] val =>

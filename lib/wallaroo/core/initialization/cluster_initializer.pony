@@ -21,8 +21,8 @@ use "net"
 use "wallaroo_labs/guid"
 use "wallaroo_labs/messages"
 use "wallaroo"
-use "wallaroo/ent/network"
-use "wallaroo/ent/recovery"
+use "wallaroo/core/network"
+use "wallaroo/core/recovery"
 use "wallaroo/core/messages"
 use "wallaroo/core/metrics"
 use "wallaroo/core/topology"
@@ -44,7 +44,7 @@ actor ClusterInitializer
   var _interconnected: USize = 1
   var _initialized: USize = 0
   var _topology_ready: Bool = false
-  var _initializer_name: String = "initializer"
+  var _initializer_name: String
 
   let _worker_names: Array[String] = Array[String]
   let _control_addrs: Map[String, (String, String)] = _control_addrs.create()
@@ -54,7 +54,7 @@ actor ClusterInitializer
     connections: Connections, distributor: Distributor,
     layout_initializer: LayoutInitializer,
     data_addr: Array[String] val, metrics_conn: MetricsSink,
-    is_recovering: Bool)
+    is_recovering: Bool, initializer_name: String)
   =>
     _auth = auth
     _worker_name = worker_name
@@ -65,6 +65,7 @@ actor ClusterInitializer
     _distributor = distributor
     _layout_initializer = layout_initializer
     if is_recovering then _topology_ready = true end
+    _initializer_name = initializer_name
 
   be start(initializer_name: String = "") =>
     // TODO: Pipeline initialization needs to be updated so that we
@@ -93,7 +94,7 @@ actor ClusterInitializer
       _control_addrs(worker) = (host, service)
       _control_identified = _control_identified + 1
       if _control_identified == _expected then
-        @printf[I32]("All worker channels identified\n".cstring())
+        @printf[I32]("All worker control channels identified\n".cstring())
 
         _create_data_channel_listeners()
       end
@@ -106,7 +107,7 @@ actor ClusterInitializer
       _data_addrs(worker) = (host, service)
       _data_identified = _data_identified + 1
       if _data_identified == _expected then
-        @printf[I32]("All worker channels identified\n".cstring())
+        @printf[I32]("All worker data channels identified\n".cstring())
 
         _create_interconnections()
       end
@@ -120,7 +121,7 @@ actor ClusterInitializer
       for (worker, topology) in ts.pairs() do
         try
           let spin_up_msg = ChannelMsgEncoder.spin_up_local_topology(
-            topology, _auth)
+            topology, _auth)?
           _connections.send_control(worker, spin_up_msg)
         end
       end
@@ -153,10 +154,6 @@ actor ClusterInitializer
           _expected)
         _distributor.topology_ready()
 
-        let topology_ready_msg =
-          ExternalMsgEncoder.topology_ready(_initializer_name)
-        _connections.send_phone_home(topology_ready_msg)
-
         _topology_ready = true
       end
     else
@@ -178,7 +175,7 @@ actor ClusterInitializer
 
     try
       let create_data_channel_listener_msg =
-        ChannelMsgEncoder.create_data_channel_listener(workers, _auth)
+        ChannelMsgEncoder.create_data_channel_listener(workers, _auth)?
       for key in _control_addrs.keys() do
         _connections.send_control(key, create_data_channel_listener_msg)
       end
@@ -196,7 +193,7 @@ actor ClusterInitializer
     (let c_addrs, let d_addrs) = _generate_addresses_map()
     try
       let message = ChannelMsgEncoder.create_connections(c_addrs, d_addrs,
-        _auth)
+        _auth)?
       for key in _control_addrs.keys() do
         _connections.send_control(key, message)
       end

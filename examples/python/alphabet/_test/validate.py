@@ -17,9 +17,9 @@ import argparse
 from json import loads
 from struct import calcsize, unpack
 
-fmt = '>LsQ'
 def decoder(bs):
-    return unpack(fmt, bs)[1:3]
+    parts = [v.strip() for v in bs.split("=>")]
+    return (parts[0], int(parts[1]))
 
 def pre_processor(decoded):
     totals = {}
@@ -27,18 +27,18 @@ def pre_processor(decoded):
         totals[c] = v
     return totals
 
-parser = argparse.ArgumentParser('Alphabet validator')
-parser.add_argument('--output', type=argparse.FileType('rb'),
+parser = argparse.ArgumentParser("Alphabet validator")
+parser.add_argument("--output", type=argparse.FileType("rb"),
                     help="The output file of the application.")
-parser.add_argument('--expected', type=argparse.FileType('r'),
+parser.add_argument("--expected", type=argparse.FileType("r"),
                     help=("A file containing the expected final vote tally as "
                           "JSON serialised dict."))
 args = parser.parse_args()
 
-chunk_size = calcsize(fmt)
 decoded = []
 while True:
-    chunk = args.output.read(chunk_size)
+    chunk = args.output.readline()
+    chunk = chunk.strip()
     if not chunk:
         break
     decoded.append(decoder(chunk))

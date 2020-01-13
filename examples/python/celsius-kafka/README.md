@@ -4,30 +4,62 @@
 
 This is an example of a stateless Python application that takes a floating point Celsius value from Kafka and sends out a floating point Fahrenheit value to Kafka.
 
-### Input and Output
+### Input
 
-The inputs and outputs of the "Celsius Kafka" application are binary 32-bit floats. Here's an example message, written as a Python string:
+The inputs of the "Celsius Kafka" application are floats in ascii text. Here's an example message:
 
 ```
-"\x42\x48\x00\x00"
+"1.8"
 ```
 
-`\x42\x48\x00\x00` -- four bytes representing the 32-bit float `50.0`
+### Output
 
+Celius will output messages that are the string representation of the converted Fahrenheit value. Each incoming message will generate a single corresponding output.
 
 ### Processing
 
-The `Decoder`'s `decode(...)` method creates a float from the value represented by the payload. The float value is then sent to the `Multiply` computation where it is multiplied by `1.8`, and the result of that computation is sent to the `Add` computation where `32` is added to it. The resulting float is then sent to the `Encoder`, which converts it to an outgoing sequence of bytes.
+The `decoder` function creates a float from the value represented by the payload. The float value is then sent to the `multiply` computation where it is multiplied by `1.8`, and the result of that computation is sent to the `add` computation where `32` is added to it. The resulting float is then sent to the `encoder` function, which converts it to an outgoing sequence of bytes.
 
 ## Running Celsius Kafka
 
-In order to run the application you will need Machida and the Cluster Shutdown tool. To build them, please see the [Linux](/book/getting-started/linux-setup.md) or [Mac OS](/book/getting-started/macos-setup.md) setup instructions.
+In order to run the application you will need Machida, Giles Sender, and the Cluster Shutdown tool. We provide instructions for building these tools yourself and we provide prebuilt binaries within a Docker container. Please visit our [setup](https://docs.wallaroolabs.com/python-installation/) instructions to choose one of these options if you have not already done so.
+If you are using Python 3, replace all instances of `machida` with `machida3` in your commands.
 
-You will also need access to a Kafka cluster. This example assumes that there is a Kafka broker listening on port `9092` on `127.0.0.1`.
+You will also need access to a Kafka cluster.
 
-You will need three separate shells to run this application. Open each shell and go to the `examples/python/celsius-kafka` directory.
+**NOTE:** If running in Docker, the Kafka cluster and kafkacat should be run from your host and not within the Docker container.
 
-### Shell 1
+You will need five separate shells to run this application (please see [starting a new shell](https://docs.wallaroolabs.com/python-tutorial/starting-a-new-shell/) for details depending on your installation choice). Open each shell and go to the `examples/python/celsius-kafka` directory.
+
+### Shell 1: Metrics
+
+Start up the Metrics UI if you don't already have it running.
+
+```bash
+metrics_reporter_ui start
+```
+
+You can verify it started up correctly by visiting [http://localhost:4000](http://localhost:4000).
+
+If you need to restart the UI, run the following.
+
+```bash
+metrics_reporter_ui restart
+```
+
+When it's time to stop the UI, run the following.
+
+```bash
+metrics_reporter_ui stop
+```
+
+If you need to start the UI after stopping it, run the following.
+
+```bash
+metrics_reporter_ui start
+```
+
+### Shell 2: Kafka setup and listener
 
 #### Start kafka and create the `test-in` and `test-out` topics
 
@@ -42,10 +74,10 @@ sudo curl -L https://github.com/docker/compose/releases/download/1.15.0/docker-c
 sudo chmod +x /usr/local/bin/docker-compose
 ```
 
-OSX: Docker compose is already included as part of Docker for Mac.
+MacOS: Docker compose is already included as part of Docker for Mac.
 
 
-NOTE: You might need to run with sudo depending on how you set up Docker.
+**NOTE:** You might need to run with sudo depending on how you set up Docker.
 
 Clone local-kafka-cluster project and run it:
 
@@ -54,97 +86,92 @@ cd /tmp
 git clone https://github.com/effata/local-kafka-cluster
 cd local-kafka-cluster
 ./cluster up 1 # change 1 to however many brokers are desired to be started
-docker exec -it local_kafka_1_1 /kafka/bin/kafka-topics.sh --zookeeper \
+sleep 1 # allow kafka to start
+docker exec -i local_kafka_1_1 /kafka/bin/kafka-topics.sh --zookeeper \
   zookeeper:2181 --create --partitions 4 --topic test-in --replication-factor \
   1 # to create a test-in topic; change arguments as desired
-docker exec -it local_kafka_1_1 /kafka/bin/kafka-topics.sh --zookeeper \
+docker exec -i local_kafka_1_1 /kafka/bin/kafka-topics.sh --zookeeper \
   zookeeper:2181 --create --partitions 4 --topic test-out --replication-factor \
   1 # to create a test-out topic; change arguments as desired
 ```
 
-#### Set up a listener to monitor the Kafka topic to which you would the application to publish results. We usually use `kafkacat`.
+**Note:** The `./cluster up 1` command outputs `Host IP used for Kafka Brokers is <YOUR_HOST_IP>`.
+
+#### Set up a listener to monitor the Kafka topic the application will publish results to. We usually use `kafkacat`.
 
 `kafkacat` can be installed via:
 
-Ubuntu:
-
 ```bash
-sudo apt-get install kafkacat
+docker pull ryane/kafkacat
 ```
 
-MacOS:
+##### Run `kafkacat` from Docker
+
+Set the Kafka broker IP address:
+
+**NOTE:** If you're running Wallaroo in Docker, you will need to replace the following with `export KAFKA_IP=*IP OUTPUT BY ./cluster up 1 COMMAND*` instead.
 
 ```bash
-brew install kafkacat
+export KAFKA_IP=$(docker inspect local_kafka_1_1 | grep kafka_ip | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
 ```
 
-To run `kafkacat` to listen to the `test-out` topic:
+To run `kafkacat` to listen to the `test-out` topic via Docker:
 
 ```bash
-kafkacat -C -b 127.0.0.1:9092 -t test-out > celsius.out
+docker run --rm -i --name kafkacatconsumer ryane/kafkacat -C -b ${KAFKA_IP}:9092 -t test-out -q -u
 ```
 
-### Shell 2
+### Shell 3: Celsius-kafka
 
-Set `PYTHONPATH` to refer to the current directory (where `celsius.py` is) and the `machida` directory (where `wallaroo.py` is). Set `PATH` to refer to the directory that contains the `machida` executable. Assuming you installed Machida according to the tutorial instructions you would do:
+Set the Kafka broker IP address:
+
+**NOTE:** If you're running Wallaroo in Docker, you will need to replace the following with `export KAFKA_IP=*IP OUTPUT BY ./cluster up 1 COMMAND*` instead.
 
 ```bash
-export PYTHONPATH="$PYTHONPATH:.:$HOME/wallaroo-tutorial/wallaroo/machida"
-export PATH="$PATH:$HOME/wallaroo-tutorial/wallaroo/machida/build"
+export KAFKA_IP=$(docker inspect local_kafka_1_1 | grep kafka_ip | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
 ```
 
 Run `machida` with `--application-module celsius`:
 
 ```bash
 machida --application-module celsius \
-  --kafka_source_topic test-in --kafka_source_brokers 127.0.0.1:9092 \
-  --kafka_sink_topic test-out --kafka_sink_brokers 127.0.0.1:9092 \
+  --kafka_source_topic test-in --kafka_source_brokers ${KAFKA_IP}:9092 \
+  --kafka_sink_topic test-out --kafka_sink_brokers ${KAFKA_IP}:9092 \
   --kafka_sink_max_message_size 100000 --kafka_sink_max_produce_buffer_ms 10 \
   --metrics 127.0.0.1:5001 --control 127.0.0.1:12500 --data 127.0.0.1:12501 \
-  --external 127.0.0.1:5050 --cluster-initializer --ponythreads=1
+  --external 127.0.0.1:5050 --cluster-initializer --ponythreads=1 \
+  --ponynoblock
 ```
 
 `kafka_sink_max_message_size` controls maximum size of message sent to kafka in a single produce request. Kafka will return errors if this is bigger than server is configured to accept.
 
 `kafka_sink_max_produce_buffer_ms` controls maximum time (in ms) to buffer messages before sending to kafka. Either don't specify it or set it to `0` to disable batching on produce.
 
-### Shell 3
+### Shell 4: Sender
 
 Send data into Kafka. Again, we use `kafakcat`.
 
-Run the following and then type at least 4 characters on each line and hit enter to send in data (only first 4 characters are used/interpreted as a float; the application will throw an error and possibly segfault if less than 4 characters are sent in):
+Set the Kafka broker IP address:
+
+**NOTE:** If you're running Wallaroo in Docker, you will need to replace the following with `export KAFKA_IP=*IP OUTPUT BY ./cluster up 1 COMMAND*` instead.
 
 ```bash
-kafkacat -P -b 127.0.0.1:9092 -t test-in
+export KAFKA_IP=$(docker inspect local_kafka_1_1 | grep kafka_ip | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
 ```
 
-Note: You can use `ctrl-d` to exit `kafkacat`
-
-## Reading the Output
-
-The output data will be in the file that `kafkacat` is writing to in shell 1. You can read the output data with the following code:
-
-```python
-import struct
-
-
-with open('celsius.out', 'rb') as f:
-    while True:
-        try:
-            print struct.unpack('>f', f.read(4))
-        except:
-            break
-```
-
-## Shutdown
-
-To shut down the cluster, you will need to use the `cluster_shutdown` tool.
+Run the following to send the numbers 1 - 100 as celsius temperatures:
 
 ```bash
-../../../utils/cluster_shutdown/cluster_shutdown 127.0.0.1:5050
+seq 1 100 | docker run --rm -i --name kafkacatproducer ryane/kafkacat -P -b ${KAFKA_IP}:9092 -t test-in
 ```
 
-You can shut down the kafkacat producer by pressing Ctrl-d from its shell.
+## Shell 5: Shutdown
+
+You can shut down the Wallaroo cluster with this command:
+
+```bash
+cluster_shutdown 127.0.0.1:5050
+```
 
 You can shut down the kafkacat consumer by pressing Ctrl-c from its shell.
 
@@ -157,4 +184,10 @@ If you followed the commands earlier to start kafka you can stop it by running:
 ```bash
 cd /tmp/local-kafka-cluster
 ./cluster down # shut down cluster
+```
+
+You can shut down the Metrics UI with the following command.
+
+```bash
+metrics_reporter_ui stop
 ```

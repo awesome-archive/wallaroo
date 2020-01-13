@@ -16,15 +16,40 @@ Copyright 2017 The Wallaroo Authors.
 
 */
 
+use "collections"
+use "wallaroo/core/barrier"
+use "wallaroo/core/checkpoint"
 use "wallaroo/core/common"
 use "wallaroo/core/metrics"
+use "wallaroo/core/recovery"
 use "wallaroo/core/routing"
 use "wallaroo/core/topology"
 
-type Sink is (Consumer & DisposableActor)
+trait tag Sink is (Consumer & DisposableActor & BarrierProcessor)
+  be checkpoint_complete(checkpoint_id: CheckpointId)
+  fun inputs(): Map[RoutingId, Producer] box
+  // Called by SinkMessageProcessor when a barrier is being handled
+  // for the first time.
+  fun ref receive_new_barrier(input_id: RoutingId, producer: Producer,
+    barrier_token: BarrierToken)
+  // Called by SinkMessageProcessor when the sink needs to do final
+  // cleanup work for rollback.
+  fun ref finish_preparing_for_rollback()
+  fun ref receive_immediate_ack() =>
+    None
+  fun ref use_normal_processor() =>
+    None
+  fun ref resume_processing_messages_queued() =>
+    None
 
 interface val SinkConfig[Out: Any val]
-  fun apply(): SinkBuilder
+  fun apply(parallelism: USize): SinkBuilder
 
 interface val SinkBuilder
-  fun apply(reporter: MetricsReporter iso): Sink
+  fun apply(sink_name: String, event_log: EventLog,
+    reporter: MetricsReporter iso, env: Env,
+    barrier_coordinator: BarrierCoordinator,
+    checkpoint_initiator: CheckpointInitiator, recovering: Bool,
+    app_name: String, worker_name: WorkerName, auth: AmbientAuth): Sink
+
+  fun parallelism(): USize

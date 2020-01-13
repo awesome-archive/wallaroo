@@ -17,7 +17,12 @@ Copyright 2017 The Wallaroo Authors.
 */
 
 #ifdef __APPLE__
-    #include <Python/Python.h>
+    #include <AvailabilityMacros.h>
+    #if MAC_OS_X_VERSION_MAX_ALLOWED < 101300
+        #include <Python/Python.h>
+    #else
+        #include <Python2.7/Python.h>
+    #endif
 #else
     #include <python2.7/Python.h>
 #endif
@@ -57,6 +62,19 @@ extern size_t list_item_count(PyObject *list)
 extern PyObject *get_application_setup_item(PyObject *list, size_t idx)
 {
   return PyList_GetItem(list, idx);
+}
+
+extern PyObject *get_list_item(PyObject *list, size_t idx)
+{
+  return PyList_GetItem(list, idx);
+}
+
+extern char *get_stage_command(PyObject *item)
+{
+  PyObject *command = PyTuple_GetItem(item, 0);
+  char * rtn = PyString_AsString(command);
+  Py_DECREF(command);
+  return rtn;
 }
 
 extern char *get_application_setup_action(PyObject *item)
@@ -125,6 +143,28 @@ extern PyObject *source_decoder_decode(PyObject *source_decoder, char *bytes, si
   return pValue;
 }
 
+extern PyObject *source_generator_initial_value(PyObject *source_generator)
+{
+  PyObject *pFunc, *pValue;
+
+  pFunc = PyObject_GetAttrString(source_generator, "initial_value");
+  pValue = PyObject_CallFunctionObjArgs(pFunc,  NULL);
+  Py_DECREF(pFunc);
+
+  return pValue;
+}
+
+extern PyObject *source_generator_apply(PyObject *source_generator, PyObject *data)
+{
+  PyObject *pFunc, *pValue;
+
+  pFunc = PyObject_GetAttrString(source_generator, "apply");
+  pValue = PyObject_CallFunctionObjArgs(pFunc, data, NULL);
+  Py_DECREF(pFunc);
+
+  return pValue;
+}
+
 extern PyObject *instantiate_python_class(PyObject *class)
 {
   return PyObject_CallFunctionObjArgs(class, NULL);
@@ -152,10 +192,7 @@ extern PyObject *computation_compute(PyObject *computation, PyObject *data,
   pValue = PyObject_CallFunctionObjArgs(pFunc, data, NULL);
   Py_DECREF(pFunc);
 
-  if (pValue != Py_None)
-    return pValue;
-  else
-    return NULL;
+  return pValue;
 }
 
 extern PyObject *sink_encoder_encode(PyObject *sink_encoder, PyObject *data)
@@ -179,17 +216,6 @@ extern void py_decref(PyObject *o)
   Py_DECREF(o);
 }
 
-extern PyObject *state_builder_build_state(PyObject *state_builder)
-{
-  PyObject *pFunc, *pArgs, *pValue;
-
-  pFunc = PyObject_GetAttrString(state_builder, "build");
-  pValue = PyObject_CallFunctionObjArgs(pFunc, NULL);
-  Py_DECREF(pFunc);
-
-  return pValue;
-}
-
 extern PyObject *stateful_computation_compute(PyObject *computation,
   PyObject *data, PyObject *state, char *method)
 {
@@ -202,39 +228,89 @@ extern PyObject *stateful_computation_compute(PyObject *computation,
   return pValue;
 }
 
+extern PyObject *initial_state(PyObject *computation)
+{
+  PyObject *pFunc, *pState;
+
+  pFunc = PyObject_GetAttrString(computation, "initial_state");
+  pState = PyObject_CallFunctionObjArgs(pFunc, NULL);
+  Py_DECREF(pFunc);
+
+  return pState;
+}
+
+extern PyObject *initial_accumulator(PyObject *aggregation)
+{
+  PyObject *pFunc, *pState;
+
+  pFunc = PyObject_GetAttrString(aggregation, "initial_accumulator");
+  pState = PyObject_CallFunctionObjArgs(pFunc, NULL);
+  Py_DECREF(pFunc);
+
+  return pState;
+}
+
+extern void aggregation_update(PyObject *aggregation, PyObject *data, PyObject *acc)
+{
+  PyObject *pFunc, *pState;
+
+  pFunc = PyObject_GetAttrString(aggregation, "update");
+  PyObject_CallFunctionObjArgs(pFunc, data, acc, NULL);
+  Py_DECREF(pFunc);
+}
+
+extern PyObject *aggregation_combine(PyObject *aggregation, PyObject *acc1, PyObject *acc2)
+{
+  PyObject *pFunc, *pState;
+
+  pFunc = PyObject_GetAttrString(aggregation, "combine");
+  pState = PyObject_CallFunctionObjArgs(pFunc, acc1, acc2, NULL);
+  Py_DECREF(pFunc);
+
+  return pState;
+}
+
+extern PyObject *aggregation_output(PyObject *aggregation, char *key, PyObject *acc)
+{
+  PyObject *pFunc, *pData, *pKey;
+
+  pKey = PyString_FromString(key);
+
+  pFunc = PyObject_GetAttrString(aggregation, "output");
+  pData = PyObject_CallFunctionObjArgs(pFunc, pKey, acc, NULL);
+  Py_DECREF(pKey);
+  Py_DECREF(pFunc);
+
+  return pData;
+}
+
 extern long key_hash(PyObject *key)
 {
   return PyObject_Hash(key);
 }
-
 
 extern int key_eq(PyObject *key, PyObject* other)
 {
   return PyObject_RichCompareBool(key, other, Py_EQ);
 }
 
-extern PyObject *partition_function_partition(PyObject *partition_function, PyObject *data)
+extern PyObject *extract_key(PyObject *key_extractor, PyObject *data)
 {
   PyObject *pFunc, *pValue;
 
-  pFunc = PyObject_GetAttrString(partition_function, "partition");
+  pFunc = PyObject_GetAttrString(key_extractor, "extract_key");
   pValue = PyObject_CallFunctionObjArgs(pFunc, data, NULL);
   Py_DECREF(pFunc);
 
   return pValue;
 }
 
-extern long partition_function_partition_u64(PyObject *partition_function, PyObject *data)
+extern int set_command_line_args(PyObject *module, PyObject *tuple)
 {
-  PyObject *pFunc, *pValue;
-
-  pFunc = PyObject_GetAttrString(partition_function, "partition");
-  pValue = PyObject_CallFunctionObjArgs(pFunc, data, NULL);
-  Py_DECREF(pFunc);
-
-  long rtn = PyInt_AsLong(pValue);
-  Py_DECREF(pValue);
-  return rtn;
+  PyObject *wallaroo = PyObject_GetAttrString(module, "wallaroo");
+  int result = PyObject_SetAttrString(wallaroo, "_ARGS", tuple);
+  Py_DECREF(wallaroo);
+  return result;
 }
 
 extern void set_user_serialization_fns(PyObject *module)
@@ -322,4 +398,9 @@ extern int is_py_none(PyObject *o)
 extern int py_list_check(PyObject *l)
 {
   return PyList_Check(l);
+}
+
+extern int py_tuple_check(PyObject *t)
+{
+  return PyTuple_Check(t);
 }

@@ -20,7 +20,9 @@ use "buffered"
 use "serialise"
 use "wallaroo_labs/bytes"
 use "wallaroo"
+use "wallaroo_labs/logging"
 use "wallaroo_labs/mort"
+use "wallaroo_labs/time"
 use "wallaroo/core/sink/tcp_sink"
 use "wallaroo/core/source"
 use "wallaroo/core/source/tcp_source"
@@ -28,36 +30,35 @@ use "wallaroo/core/topology"
 
 actor Main
   new create(env: Env) =>
+    Log.set_defaults()
     try
-      let application = recover val
-        Application("Celsius Conversion App")
-          .new_pipeline[F32, F32]("Celsius Conversion",
-            TCPSourceConfig[F32].from_options(CelsiusDecoder,
-              TCPSourceConfigCLIParser(env.args)(0)))
-            .to[F32]({(): Multiply => Multiply})
-            .to[F32]({(): Add => Add})
-            .to_sink(TCPSinkConfig[F32 val].from_options(FahrenheitEncoder,
-               TCPSinkConfigCLIParser(env.args)(0)))
-          .new_pipeline[F32, F32]("Celsius Conversion",
-            TCPSourceConfig[F32].from_options(CelsiusDecoder,
-              TCPSourceConfigCLIParser(env.args)(0)))
-            .to[F32]({(): Multiply => Multiply})
-            .to[F32]({(): Add => Add})
-            .to_sink(TCPSinkConfig[F32 val].from_options(FahrenheitEncoder,
-               TCPSinkConfigCLIParser(env.args)(0)))
+      let pipeline = recover val
+        let values = Wallaroo.source[F32]("Celsius Conversion",
+              TCPSourceConfig[F32].from_options(CelsiusDecoder,
+                TCPSourceConfigCLIParser("Celsius Conversion", env.args)?))
+
+        values
+          .collect()
+          .to[F32](Multiply)
+          .to[F32](Add)
+          .to_sinks([
+            TCPSinkConfig[F32 val].from_options(FahrenheitEncoder,
+              TCPSinkConfigCLIParser(env.args)?(0)?)
+            TCPSinkConfig[F32 val].from_options(FahrenheitEncoder,
+              TCPSinkConfigCLIParser(env.args)?(1)?) ])
       end
-      Startup(env, application, "celsius-conversion")
+      Wallaroo.build_application(env, "Celsius Conversion App", pipeline)
     else
       @printf[I32]("Couldn't build topology\n".cstring())
     end
 
-primitive Multiply is Computation[F32, F32]
+primitive Multiply is StatelessComputation[F32, F32]
   fun apply(input: F32): F32 =>
     input * 1.8
 
   fun name(): String => "Multiply by 1.8"
 
-primitive Add is Computation[F32, F32]
+primitive Add is StatelessComputation[F32, F32]
   fun apply(input: F32): F32 =>
     input + 32
 
@@ -71,9 +72,10 @@ primitive CelsiusDecoder is FramedSourceHandler[F32]
     4
 
   fun decode(data: Array[U8] val): F32 ? =>
-    Bytes.to_f32(data(0), data(1), data(2), data(3))
+    Bytes.to_f32(data(0)?, data(1)?, data(2)?, data(3)?)
 
 primitive FahrenheitEncoder
   fun apply(f: F32, wb: Writer): Array[ByteSeq] val =>
+    wb.u32_be(4)
     wb.f32_be(f)
     wb.done()

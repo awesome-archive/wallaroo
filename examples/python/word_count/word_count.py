@@ -12,6 +12,10 @@
 #  implied. See the License for the specific language governing
 #  permissions and limitations under the License.
 
+"""
+This is an example application that receives strings of text, splits it into
+individual words and counts the occurrences of each word.
+"""
 
 import string
 import struct
@@ -19,61 +23,44 @@ import wallaroo
 
 
 def application_setup(args):
-    in_host, in_port = wallaroo.tcp_parse_input_addrs(args)[0]
+    in_name, in_host, in_port = wallaroo.tcp_parse_input_addrs(args)[0]
     out_host, out_port = wallaroo.tcp_parse_output_addrs(args)[0]
 
-    word_partitions = list(string.ascii_lowercase)
-    word_partitions.append("!")
+    lines = wallaroo.source("Split and Count",
+                        wallaroo.TCPSourceConfig(in_name, in_host, in_port,
+                                                 decode_lines))
+    pipeline = (lines
+        .to(split)
+        .key_by(extract_word)
+        .to(count_word)
+        .to_sink(wallaroo.TCPSinkConfig(out_host, out_port, encode_word_count)))
 
-    ab = wallaroo.ApplicationBuilder("Word Count Application")
-    ab.new_pipeline("Split and Count",
-                    wallaroo.TCPSourceConfig(in_host, in_port, Decoder()))
-    ab.to_parallel(Split)
-    ab.to_state_partition(CountWord(), WordTotalsBuilder(), "word totals",
-        WordPartitionFunction(), word_partitions)
-    ab.to_sink(wallaroo.TCPSinkConfig(out_host, out_port, Encoder()))
-    return ab.build()
-
-
-class Split(object):
-    def name(self):
-        return "split into words"
-
-    def compute_multi(self, data):
-        punctuation = " !\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"
-
-        words = []
-
-        for line in data.split("\n"):
-            clean_line = line.lower().strip(punctuation)
-            for word in clean_line.split(' '):
-                clean_word = word.strip(punctuation)
-                words.append(clean_word)
-
-        return words
+    return wallaroo.build_application("Word Count Application", pipeline)
 
 
-class CountWord():
-    def name(self):
-        return "Count Word"
+@wallaroo.computation_multi(name="split into words")
+def split(lines):
+    punctuation = " !\"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~"
 
-    def compute(self, word, word_totals):
-        word_totals.update(word)
-        return (word_totals.get_count(word), True)
+    words = []
+
+    for line in lines.split("\n"):
+        clean_line = line.lower().strip(punctuation)
+        for word in clean_line.split(" "):
+            clean_word = word.strip(punctuation)
+            words.append(clean_word)
+
+    return words
 
 
-class WordTotals(object):
-    def __init__(self):
-        self.word_totals = {}
+class WordTotal(object):
+    count = 0
 
-    def update(self, word):
-        if self.word_totals.has_key(word):
-            self.word_totals[word] = self.word_totals[word] + 1
-        else:
-            self.word_totals[word] = 1
 
-    def get_count(self, word):
-        return WordCount(word, self.word_totals[word])
+@wallaroo.state_computation(name="count word", state=WordTotal)
+def count_word(word, word_total):
+    word_total.count = word_total.count + 1
+    return WordCount(word, word_total.count)
 
 
 class WordCount(object):
@@ -82,30 +69,17 @@ class WordCount(object):
         self.count = count
 
 
-class WordTotalsBuilder(object):
-    def build(self):
-        return WordTotals()
+@wallaroo.key_extractor
+def extract_word(word):
+    return word
 
 
-class WordPartitionFunction(object):
-    def partition(self, data):
-        if data[0] >= 'a' or data[0] <= 'z':
-          return data[0]
-        else:
-          return "!"
+@wallaroo.decoder(header_length=4, length_fmt=">I")
+def decode_lines(bs):
+    return bs.decode("utf-8")
 
 
-class Decoder(object):
-    def header_length(self):
-        return 4
-
-    def payload_length(self, bs):
-        return struct.unpack(">I", bs)[0]
-
-    def decode(self, bs):
-        return bs.decode("utf-8")
-
-
-class Encoder(object):
-    def encode(self, data):
-        return data.word + " => " + str(data.count) + "\n"
+@wallaroo.encoder
+def encode_word_count(word_count):
+    output = word_count.word + " => " + str(word_count.count) + "\n"
+    return output.encode("utf-8")

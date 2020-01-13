@@ -1,12 +1,18 @@
 /*
 
-Copyright 2017 The Wallaroo Authors.
+Copyright 2018 The Wallaroo Authors.
 
-Licensed as a Wallaroo Enterprise file under the Wallaroo Community
-License (the "License"); you may not use this file except in compliance with
-the License. You may obtain a copy of the License at
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
 
-     https://github.com/wallaroolabs/wallaroo/blob/master/LICENSE
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ implied. See the License for the specific language governing
+ permissions and limitations under the License.
 
 */
 
@@ -48,19 +54,19 @@ actor Main
     try
       let auth = env.root as AmbientAuth
 
-      let fp = FilePath(auth, input_file_path)
+      let fp = FilePath(auth, input_file_path)?
       let input = ReceiverFileDataSource(fp)
-      let output_file = File(FilePath(auth, output_file_path))
+      let output_file = File(FilePath(auth, output_file_path)?)
 
       for bytes in input do
         let fields =
           try
-            FallorMsgDecoder.with_timestamp(bytes)
+            FallorMsgDecoder.with_timestamp(bytes)?
           else
             @printf[I32]("Problem decoding!\n".cstring())
             error
           end
-        output_file.print(", ".join(fields))
+        output_file.print(", ".join(fields.values()))
       end
       output_file.dispose()
     else
@@ -81,10 +87,10 @@ class ReceiverFileDataSource is Iterator[Array[U8] val]
     end
 
   fun ref next(): Array[U8] val =>
-    // 4 bytes LENGTH HEADER + 8 byte U64 giles receiver timestamp
-    let h = _file.read(12)
+    // 4 bytes LENGTH HEADER
+    let h = _file.read(4)
     try
-      let expect: USize = Bytes.to_u32(h(0), h(1), h(2), h(3)).usize()
+      let expect: USize = Bytes.to_u32(h(0)?, h(1)?, h(2)?, h(3)?).usize()
       h.append(_file.read(expect))
       h
     else
